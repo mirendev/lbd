@@ -1,0 +1,26 @@
+# Kernel module build artifacts
+*.o
+*.ko
+*.mod.c
+*.mod.o
+# Kernel .mod files but not go.mod
+lbd_mod.mod
+*.cmd
+modules.order
+Module.symvers
+
+# Built binaries
+lbdctl
+lbdlog/lbdlog
+lbdlog/cmd/lbdlog/lbdlog
+
+# Test/data artifacts
+out2
+out3
+tmp/
+data/
+good-logs/
+check-logs/
+
+# Claude Code
+.claude/

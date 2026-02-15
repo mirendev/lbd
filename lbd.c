@@ -1,0 +1,1243 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * LBD - Logging Block Device
+ *
+ * A block device backed by a file (like loop) that logs all write
+ * operations to a companion .log file for change tracking / audit / replay.
+ */
+
+#include <linux/blkdev.h>
+#include <linux/blk-mq.h>
+#include <linux/crc32.h>
+#include <linux/file.h>
+#include <linux/fs.h>
+#include <linux/highmem.h>
+#include <linux/idr.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/ktime.h>
+#include <linux/namei.h>
+#include <linux/mnt_idmapping.h>
+#include <linux/falloc.h>
+
+#include "lbd.h"
+#include "cbor_enc.h"
+#include "lz4_kcompat.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("lbd authors");
+MODULE_DESCRIPTION("Logging Block Device");
+MODULE_VERSION(LBD_VERSION);
+
+static int lbd_major;
+static DEFINE_IDR(lbd_devices);
+static DEFINE_MUTEX(lbd_devices_mutex);
+static struct miscdevice lbd_misc;
+
+/* ----------------------------------------------------------------
+ * Block device operations
+ * ---------------------------------------------------------------- */
+
+static int lbd_open(struct gendisk *disk, unsigned int mode)
+{
+	struct lbd_device *dev = disk->private_data;
+
+	if (dev->state != LBD_STATE_BOUND)
+		return -ENXIO;
+	return 0;
+}
+
+static void lbd_release(struct gendisk *disk)
+{
+}
+
+static const struct block_device_operations lbd_fops = {
+	.owner		= THIS_MODULE,
+	.open		= lbd_open,
+	.release	= lbd_release,
+};
+
+/* ----------------------------------------------------------------
+ * I/O: read path
+ * ---------------------------------------------------------------- */
+
+static int lbd_do_read(struct lbd_device *dev, struct request *rq)
+{
+	struct req_iterator iter;
+	struct bio_vec bvec;
+	loff_t pos = (loff_t)blk_rq_pos(rq) << SECTOR_SHIFT;
+	ssize_t ret;
+
+	rq_for_each_segment(bvec, rq, iter) {
+		void *mapped = kmap_local_page(bvec.bv_page);
+
+		ret = kernel_read(dev->backing_file, mapped + bvec.bv_offset,
+				  bvec.bv_len, &pos);
+		kunmap_local(mapped);
+
+		if (ret != bvec.bv_len) {
+			if (ret >= 0)
+				ret = -EIO;
+			return ret;
+		}
+	}
+
+	atomic64_inc(&dev->stat_reads);
+	atomic64_add(blk_rq_bytes(rq), &dev->stat_read_bytes);
+	return 0;
+}
+
+/* Forward declarations */
+static const struct attribute_group lbd_attr_group;
+
+/* Forward declarations for log segmentation */
+static int lbd_open_log_file(struct lbd_device *dev);
+static void lbd_rotate_segment(struct lbd_device *dev);
+static void lbd_maybe_rotate_segment(struct lbd_device *dev);
+
+/* ----------------------------------------------------------------
+ * I/O: log write buffer
+ * ---------------------------------------------------------------- */
+
+static int lbd_log_flush(struct lbd_device *dev)
+{
+	loff_t pos;
+	ssize_t ret;
+
+	if (dev->log_buf_used == 0)
+		return 0;
+
+	/* Lazy-open: create the segment file on first flush */
+	if (!dev->log_file) {
+		int err = lbd_open_log_file(dev);
+		if (err) {
+			dev->log_buf_used = 0;
+			return err;
+		}
+	}
+
+	pos = i_size_read(file_inode(dev->log_file));
+	ret = kernel_write(dev->log_file, dev->log_buf,
+			   dev->log_buf_used, &pos);
+	if (ret != dev->log_buf_used) {
+		pr_warn_ratelimited("lbd%d: log flush failed (%zd)\n",
+				    dev->index, ret);
+		dev->log_buf_used = 0;
+		return ret < 0 ? ret : -EIO;
+	}
+	dev->log_buf_used = 0;
+	return 0;
+}
+
+static int lbd_log_buf_append(struct lbd_device *dev,
+			      const void *data, size_t len)
+{
+	if (dev->log_buf_used + len > LBD_LOG_BUF_SIZE) {
+		int ret = lbd_log_flush(dev);
+		if (ret)
+			return ret;
+	}
+	memcpy(dev->log_buf + dev->log_buf_used, data, len);
+	dev->log_buf_used += len;
+	return 0;
+}
+
+/* ----------------------------------------------------------------
+ * I/O: log write
+ * ---------------------------------------------------------------- */
+
+static void lbd_log_write(struct lbd_device *dev, struct request *rq)
+{
+	struct req_iterator iter;
+	struct bio_vec bvec;
+	u32 data_len = blk_rq_bytes(rq);
+	void *data_buf;
+	void *comp_buf = NULL;
+	int comp_len;
+	int comp_cap;
+	size_t offset = 0;
+	u8 tmp[128];
+	struct cbor_enc e;
+	u32 crc;
+	u64 ts, block;
+	int ret;
+
+	if (!data_len)
+		return;
+
+	data_buf = kvmalloc(data_len, GFP_NOIO);
+	if (!data_buf) {
+		pr_warn_ratelimited("lbd%d: log alloc failed\n", dev->index);
+		return;
+	}
+
+	/* Gather write data from bio vecs */
+	rq_for_each_segment(bvec, rq, iter) {
+		void *mapped = kmap_local_page(bvec.bv_page);
+		memcpy(data_buf + offset, mapped + bvec.bv_offset, bvec.bv_len);
+		kunmap_local(mapped);
+		offset += bvec.bv_len;
+	}
+
+	/* CRC on uncompressed data */
+	crc = crc32(~0U, data_buf, data_len) ^ ~0U;
+
+	/* LZ4-compress the data */
+	comp_cap = LZ4_compressBound(data_len);
+	comp_buf = kvmalloc(comp_cap, GFP_NOIO);
+	if (!comp_buf) {
+		pr_warn_ratelimited("lbd%d: log compress alloc failed\n",
+				    dev->index);
+		kvfree(data_buf);
+		return;
+	}
+
+	comp_len = LZ4_compress_fast_extState(dev->lz4_state,
+					      data_buf, comp_buf,
+					      data_len, comp_cap, 1);
+	if (comp_len <= 0) {
+		pr_warn_ratelimited("lbd%d: LZ4 compression failed\n",
+				    dev->index);
+		kvfree(comp_buf);
+		kvfree(data_buf);
+		return;
+	}
+
+	ts = ktime_get_real_ns();
+	block = (loff_t)blk_rq_pos(rq) * 512 / LBD_BLOCK_SIZE;
+
+	mutex_lock(&dev->log_mutex);
+
+	cbor_enc_init(&e, tmp, sizeof(tmp));
+
+	cbor_enc_map(&e, 7);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_OP);
+	cbor_enc_text(&e, "W", 1);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_TIMESTAMP);
+	cbor_enc_uint(&e, ts);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_SEQUENCE);
+	cbor_enc_uint(&e, dev->log_seq++);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_BLOCK);
+	cbor_enc_uint(&e, block);
+
+	/* Length = uncompressed size (needed for decompression) */
+	cbor_enc_uint(&e, LBD_CBOR_KEY_LENGTH);
+	cbor_enc_uint(&e, data_len);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_CHECKSUM);
+	cbor_enc_uint(&e, crc);
+
+	/* Data = LZ4-compressed bytes */
+	cbor_enc_uint(&e, LBD_CBOR_KEY_DATA);
+	cbor_enc_bytes_hdr(&e, comp_len);
+
+	if (e.err) {
+		dev->log_seq--;
+		goto warn;
+	}
+
+	ret = lbd_log_buf_append(dev, tmp, cbor_enc_len(&e));
+	if (ret)
+		goto warn;
+
+	ret = lbd_log_buf_append(dev, comp_buf, comp_len);
+	if (ret)
+		goto warn;
+
+	dev->log_has_entries = true;
+	lbd_maybe_rotate_segment(dev);
+	mutex_unlock(&dev->log_mutex);
+	kvfree(comp_buf);
+	kvfree(data_buf);
+	return;
+
+warn:
+	mutex_unlock(&dev->log_mutex);
+	kvfree(comp_buf);
+	kvfree(data_buf);
+	pr_warn_ratelimited("lbd%d: log write failed (%d)\n", dev->index, ret);
+}
+
+/* ----------------------------------------------------------------
+ * I/O: write path
+ * ---------------------------------------------------------------- */
+
+static int lbd_do_write(struct lbd_device *dev, struct request *rq)
+{
+	struct req_iterator iter;
+	struct bio_vec bvec;
+	loff_t pos = (loff_t)blk_rq_pos(rq) << SECTOR_SHIFT;
+	ssize_t ret;
+
+	rq_for_each_segment(bvec, rq, iter) {
+		void *mapped = kmap_local_page(bvec.bv_page);
+
+		ret = kernel_write(dev->backing_file, mapped + bvec.bv_offset,
+				   bvec.bv_len, &pos);
+		kunmap_local(mapped);
+
+		if (ret != bvec.bv_len) {
+			if (ret >= 0)
+				ret = -EIO;
+			return ret;
+		}
+	}
+
+	/* Log the write - failure is non-fatal */
+	lbd_log_write(dev, rq);
+
+	atomic64_inc(&dev->stat_writes);
+	atomic64_add(blk_rq_bytes(rq), &dev->stat_write_bytes);
+	return 0;
+}
+
+/* ----------------------------------------------------------------
+ * I/O: discard (TRIM) path
+ * ---------------------------------------------------------------- */
+
+static void lbd_log_discard(struct lbd_device *dev, struct request *rq)
+{
+	u8 tmp[64];
+	struct cbor_enc e;
+	u64 ts = ktime_get_real_ns();
+	u64 block = (loff_t)blk_rq_pos(rq) * 512 / LBD_BLOCK_SIZE;
+	u32 length = blk_rq_bytes(rq);
+	int ret;
+
+	mutex_lock(&dev->log_mutex);
+
+	cbor_enc_init(&e, tmp, sizeof(tmp));
+
+	cbor_enc_map(&e, 5);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_OP);
+	cbor_enc_text(&e, "T", 1);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_TIMESTAMP);
+	cbor_enc_uint(&e, ts);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_SEQUENCE);
+	cbor_enc_uint(&e, dev->log_seq++);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_BLOCK);
+	cbor_enc_uint(&e, block);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_LENGTH);
+	cbor_enc_uint(&e, length);
+
+	if (e.err) {
+		dev->log_seq--;
+		goto warn;
+	}
+
+	ret = lbd_log_buf_append(dev, tmp, cbor_enc_len(&e));
+	if (ret)
+		goto warn;
+
+	dev->log_has_entries = true;
+	lbd_maybe_rotate_segment(dev);
+	mutex_unlock(&dev->log_mutex);
+	return;
+
+warn:
+	mutex_unlock(&dev->log_mutex);
+	pr_warn_ratelimited("lbd%d: log discard failed (%d)\n", dev->index, ret);
+}
+
+static int lbd_do_discard(struct lbd_device *dev, struct request *rq)
+{
+	loff_t pos = (loff_t)blk_rq_pos(rq) << SECTOR_SHIFT;
+	unsigned int len = blk_rq_bytes(rq);
+	int ret;
+
+	if (dev->backing_file->f_op->fallocate) {
+		ret = dev->backing_file->f_op->fallocate(dev->backing_file,
+			FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, pos, len);
+		if (ret && ret != -EINVAL && ret != -EOPNOTSUPP)
+			return ret;
+	}
+
+	lbd_log_discard(dev, rq);
+
+	atomic64_inc(&dev->stat_trims);
+	atomic64_add(len, &dev->stat_trim_bytes);
+	return 0;
+}
+
+/* ----------------------------------------------------------------
+ * I/O: request dispatch
+ * ---------------------------------------------------------------- */
+
+static void lbd_handle_request(struct lbd_device *dev, struct request *rq)
+{
+	struct lbd_cmd *cmd = blk_mq_rq_to_pdu(rq);
+	int ret;
+
+	switch (req_op(rq)) {
+	case REQ_OP_READ:
+		ret = lbd_do_read(dev, rq);
+		break;
+	case REQ_OP_WRITE:
+		ret = lbd_do_write(dev, rq);
+		break;
+	case REQ_OP_DISCARD:
+		ret = lbd_do_discard(dev, rq);
+		break;
+	case REQ_OP_FLUSH:
+		ret = vfs_fsync(dev->backing_file, 0);
+		if (!ret) {
+			mutex_lock(&dev->log_mutex);
+			if (dev->log_has_entries)
+				lbd_rotate_segment(dev);
+			mutex_unlock(&dev->log_mutex);
+		}
+		break;
+	default:
+		ret = -EIO;
+		break;
+	}
+
+	cmd->ret = ret;
+}
+
+static void lbd_work_fn(struct work_struct *work)
+{
+	struct lbd_device *dev = container_of(work, struct lbd_device, work);
+	struct lbd_cmd *cmd;
+	LIST_HEAD(local_list);
+	unsigned int saved_flags = current->flags;
+
+	/* Prevent writeback deadlock (same technique as loop driver) */
+	current->flags |= PF_LOCAL_THROTTLE | PF_MEMALLOC_NOIO;
+
+	spin_lock_irq(&dev->cmd_lock);
+	list_splice_init(&dev->cmd_list, &local_list);
+	spin_unlock_irq(&dev->cmd_lock);
+
+	while (!list_empty(&local_list)) {
+		cmd = list_first_entry(&local_list, struct lbd_cmd, list_entry);
+		list_del(&cmd->list_entry);
+
+		lbd_handle_request(dev,
+			blk_mq_rq_from_pdu(cmd));
+
+		blk_mq_complete_request(blk_mq_rq_from_pdu(cmd));
+	}
+
+	current->flags = (current->flags & ~(PF_LOCAL_THROTTLE | PF_MEMALLOC_NOIO)) |
+			 (saved_flags & (PF_LOCAL_THROTTLE | PF_MEMALLOC_NOIO));
+}
+
+static void lbd_complete_rq(struct request *rq)
+{
+	struct lbd_cmd *cmd = blk_mq_rq_to_pdu(rq);
+
+	blk_mq_end_request(rq, cmd->ret ? BLK_STS_IOERR : BLK_STS_OK);
+}
+
+static blk_status_t lbd_queue_rq(struct blk_mq_hw_ctx *hctx,
+				 const struct blk_mq_queue_data *bd)
+{
+	struct lbd_device *dev = hctx->queue->queuedata;
+	struct request *rq = bd->rq;
+	struct lbd_cmd *cmd = blk_mq_rq_to_pdu(rq);
+
+	blk_mq_start_request(rq);
+
+	if (dev->state != LBD_STATE_BOUND)
+		return BLK_STS_IOERR;
+
+	INIT_LIST_HEAD(&cmd->list_entry);
+	cmd->ret = 0;
+
+	spin_lock_irq(&dev->cmd_lock);
+	list_add_tail(&cmd->list_entry, &dev->cmd_list);
+	spin_unlock_irq(&dev->cmd_lock);
+
+	queue_work(dev->wq, &dev->work);
+	return BLK_STS_OK;
+}
+
+static const struct blk_mq_ops lbd_mq_ops = {
+	.queue_rq	= lbd_queue_rq,
+	.complete	= lbd_complete_rq,
+};
+
+/* ----------------------------------------------------------------
+ * Device lifecycle
+ * ---------------------------------------------------------------- */
+
+static int lbd_write_log_header(struct lbd_device *dev)
+{
+	u8 tmp[512];
+	struct cbor_enc e;
+	size_t path_len = strlen(dev->backing_path);
+
+	cbor_enc_init(&e, tmp, sizeof(tmp));
+
+	cbor_enc_map(&e, 5);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_HDR_VERSION);
+	cbor_enc_uint(&e, LBD_LOG_VERSION);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_HDR_BLOCK_SIZE);
+	cbor_enc_uint(&e, LBD_BLOCK_SIZE);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_HDR_SEGMENT_LABEL);
+	cbor_enc_text(&e, dev->log_segment_label,
+		      strlen(dev->log_segment_label));
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_HDR_DEVICE_SIZE);
+	cbor_enc_uint(&e, dev->size);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_HDR_BACKING_PATH);
+	cbor_enc_text(&e, dev->backing_path, path_len);
+
+	if (e.err)
+		return e.err;
+
+	return lbd_log_buf_append(dev, tmp, cbor_enc_len(&e));
+}
+
+/* ----------------------------------------------------------------
+ * Log segmentation
+ * ---------------------------------------------------------------- */
+
+static int lbd_log_name_tmp(const char *label, char *buf, size_t sz)
+{
+	return snprintf(buf, sz, "disk.%s.log.tmp", label);
+}
+
+static int lbd_log_name_final(const char *label, char *buf, size_t sz)
+{
+	return snprintf(buf, sz, "disk.%s.log", label);
+}
+
+/*
+ * Generate a TAI64N label from the current wall-clock time.
+ * Format: 16 hex digits (TAI seconds) + 8 hex digits (nanoseconds).
+ * buf must be at least 25 bytes (24 chars + NUL).
+ */
+static void lbd_tai64n_label(char *buf)
+{
+	struct timespec64 ts;
+	u64 tai_secs;
+
+	ktime_get_real_ts64(&ts);
+	tai_secs = (u64)ts.tv_sec + 0x4000000000000000ULL;
+	snprintf(buf, 25, "%016llx%08lx", tai_secs, ts.tv_nsec);
+}
+
+static int lbd_rename_file(struct file *old_file, const char *new_basename)
+{
+	struct dentry *old_dentry = old_file->f_path.dentry;
+	struct dentry *parent = old_dentry->d_parent;
+	struct dentry *new_dentry;
+	struct renamedata rd;
+	int ret;
+
+	lock_rename(parent, parent);
+
+	new_dentry = lookup_one_len(new_basename, parent, strlen(new_basename));
+	if (IS_ERR(new_dentry)) {
+		ret = PTR_ERR(new_dentry);
+		goto out_unlock;
+	}
+
+	memset(&rd, 0, sizeof(rd));
+	rd.old_mnt_idmap = &nop_mnt_idmap;
+	rd.old_dir = d_inode(parent);
+	rd.old_dentry = old_dentry;
+	rd.new_mnt_idmap = &nop_mnt_idmap;
+	rd.new_dir = d_inode(parent);
+	rd.new_dentry = new_dentry;
+
+	ret = vfs_rename(&rd);
+	dput(new_dentry);
+
+out_unlock:
+	unlock_rename(parent, parent);
+	return ret;
+}
+
+/*
+ * Lazy-open the .log.tmp file for the current segment.  Called from
+ * lbd_log_flush() when buffered data first needs to hit disk.
+ */
+static int lbd_open_log_file(struct lbd_device *dev)
+{
+	char name[48];
+	struct file *f;
+
+	lbd_log_name_tmp(dev->log_segment_label, name, sizeof(name));
+
+	/*
+	 * Open relative to the log directory rather than using an
+	 * absolute path.  This avoids path resolution failures when
+	 * called from a kworker whose mount namespace differs from
+	 * the process that created the device.
+	 */
+	f = file_open_root(&dev->log_dir_path, name,
+			   O_RDWR | O_CREAT | O_TRUNC | O_LARGEFILE, 0600);
+	if (IS_ERR(f)) {
+		pr_warn("lbd%d: cannot open %s: %ld\n",
+			dev->index, name, PTR_ERR(f));
+		return PTR_ERR(f);
+	}
+
+	dev->log_file = f;
+	return 0;
+}
+
+/*
+ * Begin a new log segment.  Resets the buffer, generates a TAI64N
+ * label, and writes the CBOR header into the buffer.  No file is
+ * created on disk — that happens lazily in lbd_log_flush().
+ */
+static void lbd_begin_segment(struct lbd_device *dev)
+{
+	dev->log_file = NULL;
+	dev->log_buf_used = 0;
+	dev->log_has_entries = false;
+	dev->segment_start_time = ktime_get();
+	lbd_tai64n_label(dev->log_segment_label);
+	lbd_write_log_header(dev);
+}
+
+static void lbd_rotate_segment(struct lbd_device *dev)
+{
+	char final_name[48];
+	int ret;
+
+	if (!dev->log_has_entries)
+		return;
+
+	/* Flush buffer (lazy-opens .log.tmp) then fsync */
+	lbd_log_flush(dev);
+	if (!dev->log_file)
+		goto next;
+
+	vfs_fsync(dev->log_file, 0);
+
+	/* Rename disk.<tai64n>.log.tmp -> disk.<tai64n>.log */
+	lbd_log_name_final(dev->log_segment_label, final_name,
+			   sizeof(final_name));
+
+	ret = lbd_rename_file(dev->log_file, final_name);
+	if (ret)
+		pr_warn("lbd%d: rename to %s failed: %d\n",
+			dev->index, final_name, ret);
+
+	fput(dev->log_file);
+	dev->log_file = NULL;
+
+next:
+	atomic64_inc(&dev->stat_log_rotations);
+
+	/* Begin fresh segment (buffer only, no file yet) */
+	lbd_begin_segment(dev);
+
+	/* Reschedule age timer */
+	if (dev->log_max_age_secs > 0)
+		mod_delayed_work(system_wq, &dev->log_rotate_dwork,
+				 msecs_to_jiffies(dev->log_max_age_secs * 1000));
+}
+
+static void lbd_log_rotate_work_fn(struct work_struct *work)
+{
+	struct lbd_device *dev = container_of(work, struct lbd_device,
+					      log_rotate_dwork.work);
+
+	mutex_lock(&dev->log_mutex);
+	if (dev->log_has_entries)
+		lbd_rotate_segment(dev);
+	mutex_unlock(&dev->log_mutex);
+}
+
+static void lbd_maybe_rotate_segment(struct lbd_device *dev)
+{
+	loff_t file_size = dev->log_file ?
+		i_size_read(file_inode(dev->log_file)) : 0;
+
+	if (file_size + dev->log_buf_used >= (loff_t)dev->log_max_size)
+		lbd_rotate_segment(dev);
+}
+
+static void lbd_finalize_log(struct lbd_device *dev)
+{
+	char final_name[48];
+
+	if (dev->log_has_entries)
+		lbd_log_flush(dev);
+
+	if (!dev->log_file)
+		return;
+
+	vfs_fsync(dev->log_file, 0);
+
+	if (dev->log_has_entries) {
+		lbd_log_name_final(dev->log_segment_label, final_name,
+				   sizeof(final_name));
+		lbd_rename_file(dev->log_file, final_name);
+	}
+
+	fput(dev->log_file);
+	dev->log_file = NULL;
+}
+
+static void lbd_destroy_device(struct lbd_device *dev)
+{
+	dev->state = LBD_STATE_REMOVING;
+
+	cancel_delayed_work_sync(&dev->log_rotate_dwork);
+
+	device_remove_group(disk_to_dev(dev->gd), &lbd_attr_group);
+	del_gendisk(dev->gd);
+	flush_workqueue(dev->wq);
+	destroy_workqueue(dev->wq);
+
+	lbd_finalize_log(dev);
+	kvfree(dev->lz4_state);
+	kvfree(dev->log_buf);
+	path_put(&dev->log_dir_path);
+	if (dev->backing_file) {
+		vfs_fsync(dev->backing_file, 0);
+		fput(dev->backing_file);
+	}
+
+	put_disk(dev->gd);
+	blk_mq_free_tag_set(&dev->tag_set);
+	kfree(dev);
+}
+
+static int lbd_add_device(struct lbd_ctl_add __user *uarg)
+{
+	struct lbd_ctl_add arg;
+	struct lbd_device *dev;
+	struct inode *inode;
+	int ret, idx;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+
+	arg.path[LBD_LOG_PATH_MAX - 1] = '\0';
+	arg.log_dir[LBD_LOG_PATH_MAX - 1] = '\0';
+
+	if (arg.log_dir[0] == '\0') {
+		pr_err("lbd: log_dir is required\n");
+		return -EINVAL;
+	}
+
+	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+	if (!dev)
+		return -ENOMEM;
+
+	strscpy(dev->backing_path, arg.path, sizeof(dev->backing_path));
+	strscpy(dev->log_dir, arg.log_dir, sizeof(dev->log_dir));
+	dev->state = LBD_STATE_UNBOUND;
+	spin_lock_init(&dev->cmd_lock);
+	INIT_LIST_HEAD(&dev->cmd_list);
+	INIT_WORK(&dev->work, lbd_work_fn);
+	mutex_init(&dev->log_mutex);
+	dev->log_seq = 0;
+	dev->log_has_entries = false;
+	dev->log_max_size = arg.log_max_size ? arg.log_max_size
+					     : LBD_LOG_MAX_SIZE_DEFAULT;
+	dev->log_max_age_secs = arg.log_max_age_secs ? arg.log_max_age_secs
+						      : LBD_LOG_MAX_AGE_DEFAULT;
+	INIT_DELAYED_WORK(&dev->log_rotate_dwork, lbd_log_rotate_work_fn);
+
+	dev->log_buf = kvmalloc(LBD_LOG_BUF_SIZE, GFP_KERNEL);
+	if (!dev->log_buf) {
+		ret = -ENOMEM;
+		goto err_free;
+	}
+	dev->log_buf_used = 0;
+
+	dev->lz4_state = kvmalloc(LZ4_sizeofState(), GFP_KERNEL);
+	if (!dev->lz4_state) {
+		ret = -ENOMEM;
+		goto err_free;
+	}
+
+	/* Allocate device index */
+	mutex_lock(&lbd_devices_mutex);
+	idx = idr_alloc(&lbd_devices, dev, 0, 256, GFP_KERNEL);
+	mutex_unlock(&lbd_devices_mutex);
+	if (idx < 0) {
+		ret = idx;
+		goto err_free;
+	}
+	dev->index = idx;
+
+	/* Setup blk-mq tag set */
+	memset(&dev->tag_set, 0, sizeof(dev->tag_set));
+	dev->tag_set.ops = &lbd_mq_ops;
+	dev->tag_set.nr_hw_queues = 1;
+	dev->tag_set.queue_depth = LBD_QUEUE_DEPTH;
+	dev->tag_set.numa_node = NUMA_NO_NODE;
+	dev->tag_set.cmd_size = sizeof(struct lbd_cmd);
+	dev->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
+
+	ret = blk_mq_alloc_tag_set(&dev->tag_set);
+	if (ret)
+		goto err_idr;
+
+	/* Allocate gendisk - version dependent */
+#if LBD_HAS_BLK_MQ_ALLOC_DISK
+	dev->gd = blk_mq_alloc_disk(&dev->tag_set, dev);
+	if (IS_ERR(dev->gd)) {
+		ret = PTR_ERR(dev->gd);
+		dev->gd = NULL;
+		goto err_tagset;
+	}
+#else
+	{
+		struct request_queue *q;
+		q = blk_mq_init_queue(&dev->tag_set);
+		if (IS_ERR(q)) {
+			ret = PTR_ERR(q);
+			goto err_tagset;
+		}
+		dev->gd = alloc_disk(1);
+		if (!dev->gd) {
+			blk_cleanup_queue(q);
+			ret = -ENOMEM;
+			goto err_tagset;
+		}
+		dev->gd->queue = q;
+	}
+#endif
+
+	dev->gd->major = lbd_major;
+	dev->gd->first_minor = dev->index;
+	dev->gd->minors = 1;
+	dev->gd->fops = &lbd_fops;
+	dev->gd->private_data = dev;
+	snprintf(dev->gd->disk_name, DISK_NAME_LEN, "lbd%d", dev->index);
+
+#if !LBD_HAS_BLK_MQ_ALLOC_DISK
+	dev->gd->queue->queuedata = dev;
+#endif
+
+	/* Create workqueue */
+	dev->wq = alloc_workqueue("lbd%d", WQ_UNBOUND | WQ_MEM_RECLAIM, 0,
+				  dev->index);
+	if (!dev->wq) {
+		ret = -ENOMEM;
+		goto err_disk;
+	}
+
+	/* Open backing file */
+	dev->backing_file = filp_open(arg.path, O_RDWR | O_LARGEFILE, 0);
+	if (IS_ERR(dev->backing_file)) {
+		ret = PTR_ERR(dev->backing_file);
+		dev->backing_file = NULL;
+		pr_err("lbd: cannot open backing file '%s': %d\n", arg.path, ret);
+		goto err_wq;
+	}
+
+	inode = file_inode(dev->backing_file);
+	if (!S_ISREG(inode->i_mode)) {
+		ret = -EINVAL;
+		pr_err("lbd: backing path must be a regular file\n");
+		goto err_backing;
+	}
+
+	dev->size = i_size_read(inode);
+	if (dev->size == 0) {
+		ret = -EINVAL;
+		pr_err("lbd: backing file is empty\n");
+		goto err_backing;
+	}
+
+	/* Resolve log directory */
+	ret = kern_path(dev->log_dir, LOOKUP_DIRECTORY, &dev->log_dir_path);
+	if (ret) {
+		pr_err("lbd: cannot resolve log directory '%s': %d\n",
+		       dev->log_dir, ret);
+		goto err_backing;
+	}
+
+	/* Begin initial log segment (file created lazily on first flush) */
+	lbd_begin_segment(dev);
+
+	/* Set capacity and activate */
+	set_capacity(dev->gd, dev->size >> SECTOR_SHIFT);
+
+	/* Set queue limits */
+	blk_queue_logical_block_size(dev->gd->queue, LBD_BLOCK_SIZE);
+	blk_queue_physical_block_size(dev->gd->queue, LBD_BLOCK_SIZE);
+	blk_queue_max_hw_sectors(dev->gd->queue, 256); /* 128K max per request */
+	blk_queue_write_cache(dev->gd->queue, true, false);
+
+	blk_queue_max_discard_sectors(dev->gd->queue, UINT_MAX >> SECTOR_SHIFT);
+	dev->gd->queue->limits.discard_granularity = LBD_BLOCK_SIZE;
+
+	dev->state = LBD_STATE_BOUND;
+
+	ret = add_disk(dev->gd);
+	if (ret)
+		goto err_logdir;
+
+	ret = device_add_group(disk_to_dev(dev->gd), &lbd_attr_group);
+	if (ret)
+		pr_warn("lbd%d: failed to create sysfs group: %d\n",
+			dev->index, ret);
+
+	/* Start age-based rotation timer */
+	if (dev->log_max_age_secs > 0)
+		schedule_delayed_work(&dev->log_rotate_dwork,
+				      msecs_to_jiffies(dev->log_max_age_secs * 1000));
+
+	/* Return the assigned index to userspace */
+	arg.index = dev->index;
+	if (copy_to_user(uarg, &arg, sizeof(arg))) {
+		/* Device is live - must tear down */
+		lbd_destroy_device(dev);
+		mutex_lock(&lbd_devices_mutex);
+		idr_remove(&lbd_devices, idx);
+		mutex_unlock(&lbd_devices_mutex);
+		return -EFAULT;
+	}
+
+	pr_info("lbd%d: attached to %s (%lld bytes)\n",
+		dev->index, dev->backing_path, dev->size);
+	return 0;
+
+err_logdir:
+	path_put(&dev->log_dir_path);
+err_backing:
+	fput(dev->backing_file);
+err_wq:
+	destroy_workqueue(dev->wq);
+err_disk:
+#if !LBD_HAS_BLK_MQ_ALLOC_DISK
+	blk_cleanup_queue(dev->gd->queue);
+#endif
+	put_disk(dev->gd);
+err_tagset:
+	blk_mq_free_tag_set(&dev->tag_set);
+err_idr:
+	mutex_lock(&lbd_devices_mutex);
+	idr_remove(&lbd_devices, idx);
+	mutex_unlock(&lbd_devices_mutex);
+err_free:
+	kvfree(dev->lz4_state);
+	kvfree(dev->log_buf);
+	kfree(dev);
+	return ret;
+}
+
+static int lbd_remove_device(struct lbd_ctl_remove __user *uarg)
+{
+	struct lbd_ctl_remove arg;
+	struct lbd_device *dev;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+
+	mutex_lock(&lbd_devices_mutex);
+	dev = idr_find(&lbd_devices, arg.index);
+	if (!dev) {
+		mutex_unlock(&lbd_devices_mutex);
+		return -ENODEV;
+	}
+	if (dev->state != LBD_STATE_BOUND) {
+		mutex_unlock(&lbd_devices_mutex);
+		return -EBUSY;
+	}
+	idr_remove(&lbd_devices, arg.index);
+	mutex_unlock(&lbd_devices_mutex);
+
+	pr_info("lbd%d: detaching\n", dev->index);
+	lbd_destroy_device(dev);
+	return 0;
+}
+
+static int lbd_info_device(struct lbd_ctl_info __user *uarg)
+{
+	struct lbd_ctl_info info;
+	struct lbd_device *dev;
+
+	if (copy_from_user(&info, uarg, sizeof(info)))
+		return -EFAULT;
+
+	mutex_lock(&lbd_devices_mutex);
+	dev = idr_find(&lbd_devices, info.index);
+	if (!dev) {
+		mutex_unlock(&lbd_devices_mutex);
+		return -ENODEV;
+	}
+
+	info.state = dev->state;
+	info.size = dev->size;
+	strscpy(info.path, dev->backing_path, sizeof(info.path));
+	mutex_unlock(&lbd_devices_mutex);
+
+	if (copy_to_user(uarg, &info, sizeof(info)))
+		return -EFAULT;
+	return 0;
+}
+
+/* ----------------------------------------------------------------
+ * Sysfs stats
+ * ---------------------------------------------------------------- */
+
+static ssize_t backing_path_show(struct device *d,
+				 struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	return sysfs_emit(buf, "%s\n", dev->backing_path);
+}
+static DEVICE_ATTR_RO(backing_path);
+
+static ssize_t log_dir_show(struct device *d,
+			    struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	return sysfs_emit(buf, "%s\n", dev->log_dir);
+}
+static DEVICE_ATTR_RO(log_dir);
+
+static ssize_t state_show(struct device *d,
+			  struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+	const char *s;
+
+	switch (dev->state) {
+	case LBD_STATE_UNBOUND:  s = "unbound";  break;
+	case LBD_STATE_BOUND:    s = "bound";    break;
+	case LBD_STATE_REMOVING: s = "removing"; break;
+	default:                 s = "unknown";  break;
+	}
+	return sysfs_emit(buf, "%s\n", s);
+}
+static DEVICE_ATTR_RO(state);
+
+static ssize_t device_size_show(struct device *d,
+				struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	return sysfs_emit(buf, "%lld\n", dev->size);
+}
+static DEVICE_ATTR_RO(device_size);
+
+static ssize_t reads_show(struct device *d,
+			  struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	return sysfs_emit(buf, "%lld\n", atomic64_read(&dev->stat_reads));
+}
+static DEVICE_ATTR_RO(reads);
+
+static ssize_t writes_show(struct device *d,
+			   struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	return sysfs_emit(buf, "%lld\n", atomic64_read(&dev->stat_writes));
+}
+static DEVICE_ATTR_RO(writes);
+
+static ssize_t trims_show(struct device *d,
+			  struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	return sysfs_emit(buf, "%lld\n", atomic64_read(&dev->stat_trims));
+}
+static DEVICE_ATTR_RO(trims);
+
+static ssize_t read_bytes_show(struct device *d,
+			       struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	return sysfs_emit(buf, "%lld\n", atomic64_read(&dev->stat_read_bytes));
+}
+static DEVICE_ATTR_RO(read_bytes);
+
+static ssize_t write_bytes_show(struct device *d,
+				struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	return sysfs_emit(buf, "%lld\n", atomic64_read(&dev->stat_write_bytes));
+}
+static DEVICE_ATTR_RO(write_bytes);
+
+static ssize_t trim_bytes_show(struct device *d,
+			       struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	return sysfs_emit(buf, "%lld\n", atomic64_read(&dev->stat_trim_bytes));
+}
+static DEVICE_ATTR_RO(trim_bytes);
+
+static ssize_t log_seq_show(struct device *d,
+			    struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	return sysfs_emit(buf, "%llu\n", READ_ONCE(dev->log_seq));
+}
+static DEVICE_ATTR_RO(log_seq);
+
+static ssize_t log_segment_show(struct device *d,
+				struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	return sysfs_emit(buf, "%s\n", dev->log_segment_label);
+}
+static DEVICE_ATTR_RO(log_segment);
+
+static ssize_t log_rotations_show(struct device *d,
+				  struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	return sysfs_emit(buf, "%lld\n", atomic64_read(&dev->stat_log_rotations));
+}
+static DEVICE_ATTR_RO(log_rotations);
+
+static ssize_t log_buf_used_show(struct device *d,
+				 struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	return sysfs_emit(buf, "%zu\n", READ_ONCE(dev->log_buf_used));
+}
+static DEVICE_ATTR_RO(log_buf_used);
+
+static ssize_t segment_age_secs_show(struct device *d,
+				     struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+	s64 age = ktime_to_ms(ktime_sub(ktime_get(), dev->segment_start_time));
+
+	return sysfs_emit(buf, "%lld\n", age / 1000);
+}
+static DEVICE_ATTR_RO(segment_age_secs);
+
+static struct attribute *lbd_attrs[] = {
+	&dev_attr_backing_path.attr,
+	&dev_attr_log_dir.attr,
+	&dev_attr_state.attr,
+	&dev_attr_device_size.attr,
+	&dev_attr_reads.attr,
+	&dev_attr_writes.attr,
+	&dev_attr_trims.attr,
+	&dev_attr_read_bytes.attr,
+	&dev_attr_write_bytes.attr,
+	&dev_attr_trim_bytes.attr,
+	&dev_attr_log_seq.attr,
+	&dev_attr_log_segment.attr,
+	&dev_attr_log_rotations.attr,
+	&dev_attr_log_buf_used.attr,
+	&dev_attr_segment_age_secs.attr,
+	NULL,
+};
+
+static const struct attribute_group lbd_attr_group = {
+	.name  = "lbd",
+	.attrs = lbd_attrs,
+};
+
+/* ----------------------------------------------------------------
+ * Control device (misc device)
+ * ---------------------------------------------------------------- */
+
+static long lbd_ctl_ioctl(struct file *file, unsigned int cmd,
+			   unsigned long arg)
+{
+	switch (cmd) {
+	case LBD_CTL_ADD:
+		return lbd_add_device((struct lbd_ctl_add __user *)arg);
+	case LBD_CTL_REMOVE:
+		return lbd_remove_device((struct lbd_ctl_remove __user *)arg);
+	case LBD_CTL_INFO:
+		return lbd_info_device((struct lbd_ctl_info __user *)arg);
+	default:
+		return -ENOTTY;
+	}
+}
+
+static const struct file_operations lbd_ctl_fops = {
+	.owner		= THIS_MODULE,
+	.unlocked_ioctl	= lbd_ctl_ioctl,
+	.compat_ioctl	= compat_ptr_ioctl,
+};
+
+static struct miscdevice lbd_misc = {
+	.minor	= MISC_DYNAMIC_MINOR,
+	.name	= LBD_CTL_NAME,
+	.fops	= &lbd_ctl_fops,
+};
+
+/* ----------------------------------------------------------------
+ * Module init / exit
+ * ---------------------------------------------------------------- */
+
+static int __init lbd_init(void)
+{
+	int ret;
+
+	lbd_major = register_blkdev(0, LBD_NAME);
+	if (lbd_major < 0) {
+		pr_err("lbd: failed to register block device\n");
+		return lbd_major;
+	}
+
+	idr_init(&lbd_devices);
+
+	ret = misc_register(&lbd_misc);
+	if (ret) {
+		pr_err("lbd: failed to register control device\n");
+		idr_destroy(&lbd_devices);
+		unregister_blkdev(lbd_major, LBD_NAME);
+		return ret;
+	}
+
+	pr_info("lbd: module loaded (major=%d)\n", lbd_major);
+	return 0;
+}
+
+static void __exit lbd_exit(void)
+{
+	struct lbd_device *dev;
+	int id;
+
+	misc_deregister(&lbd_misc);
+
+	mutex_lock(&lbd_devices_mutex);
+	idr_for_each_entry(&lbd_devices, dev, id) {
+		idr_remove(&lbd_devices, id);
+		mutex_unlock(&lbd_devices_mutex);
+		lbd_destroy_device(dev);
+		mutex_lock(&lbd_devices_mutex);
+	}
+	mutex_unlock(&lbd_devices_mutex);
+
+	idr_destroy(&lbd_devices);
+	unregister_blkdev(lbd_major, LBD_NAME);
+
+	pr_info("lbd: module unloaded\n");
+}
+
+module_init(lbd_init);
+module_exit(lbd_exit);
