@@ -376,7 +376,7 @@ func replayToQCow2(logFiles []string, outputPath string, deviceSize uint64, bloc
 		return fmt.Errorf("creating qcow2 image: %w", err)
 	}
 
-	var totalEntries, totalWrites, totalTrims, totalSnaps, crcErrors int
+	var totalEntries, totalWrites, totalTrims, crcErrors int
 	var totalBytes uint64
 
 	for _, logPath := range logFiles {
@@ -405,27 +405,15 @@ func replayToQCow2(logFiles []string, outputPath string, deviceSize uint64, bloc
 			}
 
 			totalEntries++
+
+			if e.IsSnapshotCreate() || e.IsSnapshotDelete() {
+				// Internal snapshots not supported — skip
+				continue
+			}
+
 			offset := int64(e.Block) * int64(blockSize)
 
-			if e.IsSnapshotCreate() {
-				name := e.SnapshotCreateName()
-				if err := img.SnapshotCreate(name); err != nil {
-					f.Close()
-					img.Close()
-					return fmt.Errorf("creating snapshot %q: %w", name, err)
-				}
-				totalSnaps++
-				fmt.Printf("  snapshot create: %q\n", name)
-			} else if e.IsSnapshotDelete() {
-				id := e.SnapshotDeleteID()
-				if err := img.SnapshotDelete(id); err != nil {
-					f.Close()
-					img.Close()
-					return fmt.Errorf("deleting snapshot %d: %w", id, err)
-				}
-				totalSnaps++
-				fmt.Printf("  snapshot delete: %d\n", id)
-			} else if e.IsWrite() {
+			if e.IsWrite() {
 				if !e.ValidateCRC() {
 					crcErrors++
 					fmt.Fprintf(os.Stderr, "Warning: CRC mismatch at entry seq=%d in %s\n", e.Sequence, logPath)
@@ -455,8 +443,8 @@ func replayToQCow2(logFiles []string, outputPath string, deviceSize uint64, bloc
 		return fmt.Errorf("closing qcow2 image: %w", err)
 	}
 
-	fmt.Printf("Replayed %d entries (%d writes, %d trims, %d snapshots) from %d segments\n",
-		totalEntries, totalWrites, totalTrims, totalSnaps, len(logFiles))
+	fmt.Printf("Replayed %d entries (%d writes, %d trims) from %d segments\n",
+		totalEntries, totalWrites, totalTrims, len(logFiles))
 	fmt.Printf("Output: %s (qcow2-lz4, virtual %s)\n", outputPath, fmtSize(deviceSize))
 	fmt.Printf("CRC errors: %d\n", crcErrors)
 
