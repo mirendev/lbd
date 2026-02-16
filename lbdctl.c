@@ -41,7 +41,6 @@
 #define LBD_CBOR_KEY_LENGTH		5
 #define LBD_CBOR_KEY_CHECKSUM		6
 #define LBD_CBOR_KEY_DATA		7
-#define LBD_CBOR_KEY_SNAP_NAME		8
 
 #define LBD_CTL_MAGIC		'L'
 

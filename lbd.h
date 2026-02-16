@@ -86,7 +86,6 @@ struct lbd_ctl_info {
 #define LBD_CBOR_KEY_LENGTH		5
 #define LBD_CBOR_KEY_CHECKSUM		6
 #define LBD_CBOR_KEY_DATA		7
-#define LBD_CBOR_KEY_SNAP_NAME		8
 
 /* Per-request data (embedded in blk-mq PDU) */
 struct lbd_cmd {

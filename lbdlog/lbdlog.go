@@ -22,16 +22,15 @@ type Header struct {
 	BackingPath string `cbor:"5,keyasint"`
 }
 
-// Entry is a single log entry (write, trim, or snapshot operation).
+// Entry is a single log entry (write or trim).
 type Entry struct {
-	Op          string      `cbor:"1,keyasint"`
-	TimestampNS uint64      `cbor:"2,keyasint"`
-	Sequence    uint64      `cbor:"3,keyasint"`
-	Block       uint64      `cbor:"4,keyasint"`
-	Length      uint32      `cbor:"5,keyasint"`
-	Checksum    uint32      `cbor:"6,keyasint,omitempty"`
-	Data        []byte      `cbor:"7,keyasint,omitempty"`
-	SnapName    interface{} `cbor:"8,keyasint,omitempty"` // string for "S", uint64 for "X"
+	Op          string `cbor:"1,keyasint"`
+	TimestampNS uint64 `cbor:"2,keyasint"`
+	Sequence    uint64 `cbor:"3,keyasint"`
+	Block       uint64 `cbor:"4,keyasint"`
+	Length      uint32 `cbor:"5,keyasint"`
+	Checksum    uint32 `cbor:"6,keyasint,omitempty"`
+	Data        []byte `cbor:"7,keyasint,omitempty"`
 
 	CompressedSize int `cbor:"-"` // populated by Reader after LZ4 decompression
 }
@@ -41,31 +40,6 @@ func (e *Entry) IsWrite() bool { return e.Op == "W" }
 
 // IsTrim reports whether the entry is a trim/discard operation.
 func (e *Entry) IsTrim() bool { return e.Op == "T" }
-
-// IsSnapshotCreate reports whether the entry is a snapshot create marker.
-func (e *Entry) IsSnapshotCreate() bool { return e.Op == "S" }
-
-// IsSnapshotDelete reports whether the entry is a snapshot delete marker.
-func (e *Entry) IsSnapshotDelete() bool { return e.Op == "X" }
-
-// SnapshotCreateName returns the snapshot name for "S" entries.
-func (e *Entry) SnapshotCreateName() string {
-	if s, ok := e.SnapName.(string); ok {
-		return s
-	}
-	return ""
-}
-
-// SnapshotDeleteID returns the snapshot ID for "X" entries.
-func (e *Entry) SnapshotDeleteID() uint32 {
-	switch v := e.SnapName.(type) {
-	case uint64:
-		return uint32(v)
-	case int64:
-		return uint32(v)
-	}
-	return 0
-}
 
 // ValidateCRC checks that the entry's CRC32 matches its data.
 // Returns true for trim entries (which have no data or checksum).

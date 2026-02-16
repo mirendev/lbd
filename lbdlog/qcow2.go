@@ -218,8 +218,7 @@ func (img *QCow2Image) SetReadOnly(v bool) {
 	img.readOnly = v
 }
 
-// Close flushes all dirty L2 tables, refcount/snapshot metadata, and the header,
-// then closes the file.
+// Close flushes all dirty L2 tables and the header, then closes the file.
 func (img *QCow2Image) Close() error {
 	if !img.readOnly {
 		// Flush all cached L2 tables
