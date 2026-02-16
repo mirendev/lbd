@@ -42,6 +42,9 @@ enum lbd_state {
 #define LBD_CTL_ADD		_IOWR(LBD_CTL_MAGIC, 0, struct lbd_ctl_add)
 #define LBD_CTL_REMOVE		_IOW(LBD_CTL_MAGIC, 1, struct lbd_ctl_remove)
 #define LBD_CTL_INFO		_IOWR(LBD_CTL_MAGIC, 2, struct lbd_ctl_info)
+#define LBD_CTL_SNAPSHOT_CREATE	_IOW(LBD_CTL_MAGIC, 3, struct lbd_ctl_snapshot)
+#define LBD_CTL_SNAPSHOT_DELETE	_IOW(LBD_CTL_MAGIC, 4, struct lbd_ctl_snapshot)
+#define LBD_CTL_SNAPSHOT_LIST	_IOWR(LBD_CTL_MAGIC, 5, struct lbd_ctl_snapshot_list)
 
 struct lbd_ctl_add {
 	char path[LBD_LOG_PATH_MAX];
@@ -61,6 +64,19 @@ struct lbd_ctl_info {
 	__u32 state;
 	__u64 size;
 	char path[LBD_LOG_PATH_MAX];
+};
+
+struct lbd_ctl_snapshot {
+	__s32 index;
+	__u32 snapshot_id;		/* delete: ID to delete; create: unused */
+	char name[256];			/* create: snapshot name */
+};
+
+struct lbd_ctl_snapshot_list {
+	__s32 index;
+	__u32 count;			/* out: number of snapshots */
+	__u32 buf_size;			/* in: size of user buffer */
+	__u64 buf;			/* in: pointer to user buffer */
 };
 
 /*
@@ -86,6 +102,7 @@ struct lbd_ctl_info {
 #define LBD_CBOR_KEY_LENGTH		5
 #define LBD_CBOR_KEY_CHECKSUM		6
 #define LBD_CBOR_KEY_DATA		7
+#define LBD_CBOR_KEY_SNAP_NAME		8
 
 /* Per-request data (embedded in blk-mq PDU) */
 struct lbd_cmd {
@@ -97,6 +114,7 @@ struct lbd_cmd {
 struct lbd_device {
 	int index;
 	enum lbd_state state;
+	atomic_t open_count;
 
 	struct gendisk *gd;
 	struct blk_mq_tag_set tag_set;

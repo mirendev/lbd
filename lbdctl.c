@@ -41,6 +41,7 @@
 #define LBD_CBOR_KEY_LENGTH		5
 #define LBD_CBOR_KEY_CHECKSUM		6
 #define LBD_CBOR_KEY_DATA		7
+#define LBD_CBOR_KEY_SNAP_NAME		8
 
 #define LBD_CTL_MAGIC		'L'
 
@@ -64,9 +65,25 @@ struct lbd_ctl_info {
 	char path[LBD_LOG_PATH_MAX];
 };
 
+struct lbd_ctl_snapshot {
+	__s32 index;
+	__u32 snapshot_id;
+	char name[256];
+};
+
+struct lbd_ctl_snapshot_list {
+	__s32 index;
+	__u32 count;
+	__u32 buf_size;
+	__u64 buf;
+};
+
 #define LBD_CTL_ADD		_IOWR(LBD_CTL_MAGIC, 0, struct lbd_ctl_add)
 #define LBD_CTL_REMOVE		_IOW(LBD_CTL_MAGIC, 1, struct lbd_ctl_remove)
 #define LBD_CTL_INFO		_IOWR(LBD_CTL_MAGIC, 2, struct lbd_ctl_info)
+#define LBD_CTL_SNAPSHOT_CREATE	_IOW(LBD_CTL_MAGIC, 3, struct lbd_ctl_snapshot)
+#define LBD_CTL_SNAPSHOT_DELETE	_IOW(LBD_CTL_MAGIC, 4, struct lbd_ctl_snapshot)
+#define LBD_CTL_SNAPSHOT_LIST	_IOWR(LBD_CTL_MAGIC, 5, struct lbd_ctl_snapshot_list)
 
 #define LBD_CTL_PATH		"/dev/lbd-control"
 
@@ -990,6 +1007,11 @@ static int cmd_create(int argc, char **argv)
 	lbd_qcow2_hdr_set_alloc_offset(hdr, alloc_offset);
 	lbd_qcow2_hdr_set_comp_type(hdr, LBD_QCOW2_COMP_LZ4);
 	lbd_qcow2_hdr_set_free_list(hdr, 0);
+	lbd_qcow2_hdr_set_incompat_feat(hdr, 0);
+	lbd_qcow2_hdr_set_refcount_table(hdr, 0);
+	lbd_qcow2_hdr_set_refcount_clusters(hdr, 0);
+	lbd_qcow2_hdr_set_snapshot_table(hdr, 0);
+	lbd_qcow2_hdr_set_snapshot_count(hdr, 0);
 
 	fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
 	if (fd < 0) {
@@ -1180,7 +1202,7 @@ static int cmd_convert(const char *flat_path, const char *qcow2_path)
 		if (comp_len > 0 &&
 		    (uint32_t)comp_len < cluster_size - sizeof(uint32_t)) {
 			/* Store compressed */
-			uint32_t total_on_disk = ((sizeof(uint32_t) + comp_len) + 511) & ~511U;
+			uint32_t total_on_disk = ((sizeof(uint32_t) + comp_len) + 4095) & ~4095U;
 			uint64_t phys = alloc_offset;
 			uint32_t comp_size_be = htobe32_val(comp_len);
 
@@ -1260,6 +1282,11 @@ static int cmd_convert(const char *flat_path, const char *qcow2_path)
 	lbd_qcow2_hdr_set_alloc_offset(hdr, alloc_offset);
 	lbd_qcow2_hdr_set_comp_type(hdr, LBD_QCOW2_COMP_LZ4);
 	lbd_qcow2_hdr_set_free_list(hdr, 0);
+	lbd_qcow2_hdr_set_incompat_feat(hdr, 0);
+	lbd_qcow2_hdr_set_refcount_table(hdr, 0);
+	lbd_qcow2_hdr_set_refcount_clusters(hdr, 0);
+	lbd_qcow2_hdr_set_snapshot_table(hdr, 0);
+	lbd_qcow2_hdr_set_snapshot_count(hdr, 0);
 
 	n = pwrite(out_fd, hdr, LBD_QCOW2_HEADER_SIZE, 0);
 	if (n != LBD_QCOW2_HEADER_SIZE) {
@@ -1761,7 +1788,7 @@ static int cmd_compact(int argc, char **argv)
 
 		if (comp_len > 0 &&
 		    (uint32_t)comp_len < cluster_size - sizeof(uint32_t)) {
-			uint32_t total_on_disk = ((sizeof(uint32_t) + comp_len) + 511) & ~511U;
+			uint32_t total_on_disk = ((sizeof(uint32_t) + comp_len) + 4095) & ~4095U;
 			uint64_t phys = new_alloc_offset;
 			uint32_t comp_size_be = htobe32_val(comp_len);
 
@@ -1816,6 +1843,11 @@ static int cmd_compact(int argc, char **argv)
 	lbd_qcow2_hdr_set_alloc_offset(hdr, new_alloc_offset);
 	lbd_qcow2_hdr_set_comp_type(hdr, LBD_QCOW2_COMP_LZ4);
 	lbd_qcow2_hdr_set_free_list(hdr, 0);
+	lbd_qcow2_hdr_set_incompat_feat(hdr, 0);
+	lbd_qcow2_hdr_set_refcount_table(hdr, 0);
+	lbd_qcow2_hdr_set_refcount_clusters(hdr, 0);
+	lbd_qcow2_hdr_set_snapshot_table(hdr, 0);
+	lbd_qcow2_hdr_set_snapshot_count(hdr, 0);
 
 	if (pwrite(out_fd, hdr, LBD_QCOW2_HEADER_SIZE, 0) != LBD_QCOW2_HEADER_SIZE)
 		goto compact_err;
@@ -1888,6 +1920,157 @@ compact_err:
 }
 
 /* ----------------------------------------------------------------
+ * Snapshot commands
+ * ---------------------------------------------------------------- */
+
+static int cmd_snapshot_create(const char *index_str, const char *name)
+{
+	struct lbd_ctl_snapshot arg;
+	int fd, ret;
+
+	memset(&arg, 0, sizeof(arg));
+	arg.index = atoi(index_str);
+	strncpy(arg.name, name, sizeof(arg.name) - 1);
+
+	fd = open(LBD_CTL_PATH, O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "Cannot open %s: %s\n",
+			LBD_CTL_PATH, strerror(errno));
+		return 1;
+	}
+
+	ret = ioctl(fd, LBD_CTL_SNAPSHOT_CREATE, &arg);
+	close(fd);
+
+	if (ret < 0) {
+		fprintf(stderr, "Snapshot create failed: %s\n", strerror(errno));
+		return 1;
+	}
+
+	printf("Created snapshot '%s' on lbd%d\n", name, arg.index);
+	return 0;
+}
+
+static int cmd_snapshot_delete(const char *index_str, const char *id_str)
+{
+	struct lbd_ctl_snapshot arg;
+	int fd, ret;
+
+	memset(&arg, 0, sizeof(arg));
+	arg.index = atoi(index_str);
+	arg.snapshot_id = atoi(id_str);
+
+	fd = open(LBD_CTL_PATH, O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "Cannot open %s: %s\n",
+			LBD_CTL_PATH, strerror(errno));
+		return 1;
+	}
+
+	ret = ioctl(fd, LBD_CTL_SNAPSHOT_DELETE, &arg);
+	close(fd);
+
+	if (ret < 0) {
+		fprintf(stderr, "Snapshot delete failed: %s\n", strerror(errno));
+		return 1;
+	}
+
+	printf("Deleted snapshot %u on lbd%d\n", arg.snapshot_id, arg.index);
+	return 0;
+}
+
+static int cmd_snapshot_list(const char *index_str)
+{
+	struct lbd_ctl_snapshot_list arg;
+	int fd, ret;
+	uint8_t *buf;
+	uint32_t buf_size = 4096;
+
+	buf = malloc(buf_size);
+	if (!buf) {
+		fprintf(stderr, "Out of memory\n");
+		return 1;
+	}
+
+	memset(&arg, 0, sizeof(arg));
+	arg.index = atoi(index_str);
+	arg.buf_size = buf_size;
+	arg.buf = (uint64_t)(unsigned long)buf;
+
+	fd = open(LBD_CTL_PATH, O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "Cannot open %s: %s\n",
+			LBD_CTL_PATH, strerror(errno));
+		free(buf);
+		return 1;
+	}
+
+	ret = ioctl(fd, LBD_CTL_SNAPSHOT_LIST, &arg);
+	close(fd);
+
+	if (ret < 0) {
+		fprintf(stderr, "Snapshot list failed: %s\n", strerror(errno));
+		free(buf);
+		return 1;
+	}
+
+	printf("Snapshots on lbd%d: %u\n", arg.index, arg.count);
+
+	/* Parse snapshot entries from buffer */
+	{
+		uint32_t i;
+		size_t off = 0;
+
+		for (i = 0; i < arg.count && off < buf_size; i++) {
+			uint32_t snap_id, l1_size, date_sec, date_nsec;
+			uint64_t l1_offset;
+			uint16_t name_len;
+			char name[256];
+			uint32_t entry_size;
+			time_t ts;
+			struct tm *tm;
+			char time_buf[64];
+
+			if (off + 26 > buf_size)
+				break;
+
+			snap_id = _qcow2_get32(buf + off, 0);
+			l1_offset = _qcow2_get64(buf + off, 4);
+			l1_size = _qcow2_get32(buf + off, 12);
+			date_sec = _qcow2_get32(buf + off, 16);
+			date_nsec = _qcow2_get32(buf + off, 20);
+			name_len = _qcow2_get16(buf + off, 24);
+
+			if (off + 26 + name_len > buf_size)
+				break;
+
+			memcpy(name, buf + off + 26, name_len);
+			name[name_len] = '\0';
+
+			ts = date_sec;
+			tm = localtime(&ts);
+			strftime(time_buf, sizeof(time_buf),
+				 "%Y-%m-%d %H:%M:%S", tm);
+
+			printf("  ID %u: \"%s\" created %s "
+			       "(l1_off=%llu, l1_size=%u)\n",
+			       snap_id, name, time_buf,
+			       (unsigned long long)l1_offset, l1_size);
+
+			(void)l1_offset;
+			(void)date_nsec;
+
+			entry_size = 26 + name_len;
+			entry_size = (entry_size + 7) & ~7U;
+			off += entry_size;
+		}
+	}
+
+	free(buf);
+	return 0;
+}
+
+/* ----------------------------------------------------------------
  * Main
  * ---------------------------------------------------------------- */
 
@@ -1903,6 +2086,9 @@ static void usage(void)
 		"  lbdctl convert <flat> <qcow2>      Convert flat image to qcow2-lz4\n"
 		"  lbdctl extract <qcow2> <flat>      Extract qcow2-lz4 to flat image\n"
 		"  lbdctl compact <qcow2>             Compact qcow2-lz4 image (reclaim space)\n"
+		"  lbdctl snapshot create <N> <name>  Create snapshot on /dev/lbdN\n"
+		"  lbdctl snapshot delete <N> <id>    Delete snapshot by ID on /dev/lbdN\n"
+		"  lbdctl snapshot list <N>           List snapshots on /dev/lbdN\n"
 		"\n"
 		"Add options:\n"
 		"  --log-dir <dir>          Directory to write log files (required)\n"
@@ -1976,6 +2162,36 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		return cmd_compact(argc - 2, argv + 2);
+	}
+
+	if (strcmp(argv[1], "snapshot") == 0) {
+		if (argc < 3) {
+			fprintf(stderr, "snapshot requires a subcommand (create/delete/list)\n");
+			return 1;
+		}
+		if (strcmp(argv[2], "create") == 0) {
+			if (argc < 5) {
+				fprintf(stderr, "snapshot create requires <N> <name>\n");
+				return 1;
+			}
+			return cmd_snapshot_create(argv[3], argv[4]);
+		}
+		if (strcmp(argv[2], "delete") == 0) {
+			if (argc < 5) {
+				fprintf(stderr, "snapshot delete requires <N> <id>\n");
+				return 1;
+			}
+			return cmd_snapshot_delete(argv[3], argv[4]);
+		}
+		if (strcmp(argv[2], "list") == 0) {
+			if (argc < 4) {
+				fprintf(stderr, "snapshot list requires <N>\n");
+				return 1;
+			}
+			return cmd_snapshot_list(argv[3]);
+		}
+		fprintf(stderr, "Unknown snapshot subcommand: %s\n", argv[2]);
+		return 1;
 	}
 
 	if (strcmp(argv[1], "log") == 0) {

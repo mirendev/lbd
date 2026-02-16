@@ -86,7 +86,7 @@ static u64 lbd_qcow2_read_old_alloc_size(struct lbd_device *dev, u64 l2_entry)
 			return 0;
 
 		comp_size = be32_to_cpu(comp_size_be);
-		return ALIGN(sizeof(__be32) + comp_size, 512);
+		return ALIGN(sizeof(__be32) + comp_size, 4096);
 	}
 
 	return q->cluster_size;
@@ -118,6 +118,459 @@ static int lbd_qcow2_free_extent(struct lbd_device *dev, loff_t phys_offset,
 	q->free_list_head = phys_offset;
 	atomic64_inc(&dev->stat_alloc_freed);
 	return lbd_qcow2_write_free_list_head(dev);
+}
+
+/* ----------------------------------------------------------------
+ * Header persistence helpers for new fields
+ * ---------------------------------------------------------------- */
+
+static int lbd_qcow2_write_incompat_features(struct lbd_device *dev)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	u8 buf[8];
+	loff_t pos = LBD_QCOW2_OFF_INCOMPAT_FEAT;
+	ssize_t ret;
+
+	_qcow2_put64(buf, 0, q->incompatible_features);
+	ret = kernel_write(dev->backing_file, buf, 8, &pos);
+	if (ret != 8)
+		return ret < 0 ? ret : -EIO;
+	return 0;
+}
+
+static int lbd_qcow2_write_snapshot_header(struct lbd_device *dev)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	u8 buf[16];
+	loff_t pos;
+	ssize_t ret;
+
+	/* Write snapshot_table_offset (8 bytes at offset 76) */
+	pos = LBD_QCOW2_OFF_SNAPSHOT_TABLE;
+	_qcow2_put64(buf, 0, q->snapshot_table_offset);
+	ret = kernel_write(dev->backing_file, buf, 8, &pos);
+	if (ret != 8)
+		return ret < 0 ? ret : -EIO;
+
+	/* Write snapshot_count (4 bytes at offset 84) */
+	pos = LBD_QCOW2_OFF_SNAPSHOT_COUNT;
+	_qcow2_put32(buf, 0, q->snapshot_count);
+	ret = kernel_write(dev->backing_file, buf, 4, &pos);
+	if (ret != 4)
+		return ret < 0 ? ret : -EIO;
+
+	return 0;
+}
+
+static int lbd_qcow2_write_refcount_header(struct lbd_device *dev)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	u8 buf[8];
+	loff_t pos;
+	ssize_t ret;
+
+	/* Write refcount_table_offset (8 bytes at offset 64) */
+	pos = LBD_QCOW2_OFF_REFCOUNT_TABLE;
+	_qcow2_put64(buf, 0, q->refcount_table_offset);
+	ret = kernel_write(dev->backing_file, buf, 8, &pos);
+	if (ret != 8)
+		return ret < 0 ? ret : -EIO;
+
+	/* Write refcount_table_clusters (4 bytes at offset 72) */
+	pos = LBD_QCOW2_OFF_REFCOUNT_CLUSTERS;
+	_qcow2_put32(buf, 0, q->refcount_table_clusters);
+	ret = kernel_write(dev->backing_file, buf, 4, &pos);
+	if (ret != 4)
+		return ret < 0 ? ret : -EIO;
+
+	return 0;
+}
+
+/* ----------------------------------------------------------------
+ * Refcount block cache
+ * ---------------------------------------------------------------- */
+
+static inline u64 lbd_qcow2_refcount_lru_tick(struct lbd_qcow2 *q)
+{
+	return q->lru_tick++;  /* shared with L2/cl cache, that's fine */
+}
+
+/* Flush a dirty refcount block to disk */
+static int lbd_qcow2_refcount_block_flush(struct lbd_device *dev,
+					   struct lbd_refcount_cache_entry *e)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	u64 block_phys;
+	__be16 *disk_block;
+	loff_t pos;
+	ssize_t ret;
+	u32 i;
+
+	if (!e->valid || !e->dirty)
+		return 0;
+
+	if (e->block_index >= q->refcount_table_clusters)
+		return -EIO;
+
+	block_phys = q->refcount_table[e->block_index];
+	if (!block_phys)
+		return -EIO;
+
+	disk_block = kvmalloc(q->cluster_size, GFP_NOIO);
+	if (!disk_block)
+		return -ENOMEM;
+
+	for (i = 0; i < q->refcount_entries_per_block; i++)
+		disk_block[i] = cpu_to_be16(e->entries[i]);
+
+	pos = block_phys;
+	ret = kernel_write(dev->backing_file, disk_block, q->cluster_size, &pos);
+	kvfree(disk_block);
+
+	if (ret != q->cluster_size)
+		return ret < 0 ? ret : -EIO;
+
+	e->dirty = false;
+	return 0;
+}
+
+/* Get a refcount block into cache */
+static struct lbd_refcount_cache_entry *
+lbd_qcow2_refcount_block_get(struct lbd_device *dev, u32 block_index)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	struct lbd_refcount_cache_entry *best = NULL;
+	u64 oldest = U64_MAX;
+	int i;
+
+	/* Check cache for hit */
+	for (i = 0; i < LBD_QCOW2_REFCOUNT_CACHE_SIZE; i++) {
+		struct lbd_refcount_cache_entry *e = &q->refcount_cache[i];
+		if (e->valid && e->block_index == block_index) {
+			e->lru = lbd_qcow2_refcount_lru_tick(q);
+			return e;
+		}
+	}
+
+	/* Cache miss: find LRU entry to evict */
+	for (i = 0; i < LBD_QCOW2_REFCOUNT_CACHE_SIZE; i++) {
+		struct lbd_refcount_cache_entry *e = &q->refcount_cache[i];
+		if (!e->valid) {
+			best = e;
+			break;
+		}
+		if (e->lru < oldest) {
+			oldest = e->lru;
+			best = e;
+		}
+	}
+
+	/* Flush dirty before eviction */
+	if (best->valid && best->dirty)
+		lbd_qcow2_refcount_block_flush(dev, best);
+
+	best->block_index = block_index;
+	best->dirty = false;
+	best->lru = lbd_qcow2_refcount_lru_tick(q);
+
+	if (block_index < q->refcount_table_clusters &&
+	    q->refcount_table[block_index] != 0) {
+		loff_t pos = q->refcount_table[block_index];
+		__be16 *disk_block;
+		ssize_t ret;
+
+		disk_block = kvmalloc(q->cluster_size, GFP_NOIO);
+		if (!disk_block) {
+			best->valid = false;
+			return NULL;
+		}
+
+		ret = kernel_read(dev->backing_file, disk_block,
+				  q->cluster_size, &pos);
+		if (ret != q->cluster_size) {
+			kvfree(disk_block);
+			best->valid = false;
+			return NULL;
+		}
+
+		for (i = 0; i < q->refcount_entries_per_block; i++)
+			best->entries[i] = be16_to_cpu(disk_block[i]);
+
+		kvfree(disk_block);
+	} else {
+		memset(best->entries, 0, q->cluster_size);
+	}
+
+	best->valid = true;
+	return best;
+}
+
+/* Get the refcount for a host cluster */
+static u16 lbd_qcow2_get_refcount(struct lbd_device *dev, u64 host_cluster)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	u32 block_index = host_cluster / q->refcount_entries_per_block;
+	u32 entry_index = host_cluster % q->refcount_entries_per_block;
+	struct lbd_refcount_cache_entry *e;
+
+	if (!q->refcount_table)
+		return 0;
+
+	if (block_index >= q->refcount_table_clusters)
+		return 0;
+
+	e = lbd_qcow2_refcount_block_get(dev, block_index);
+	if (!e)
+		return 0;
+
+	return e->entries[entry_index];
+}
+
+/* Set the refcount for a host cluster */
+static int lbd_qcow2_set_refcount(struct lbd_device *dev, u64 host_cluster,
+				   u16 value)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	u32 block_index = host_cluster / q->refcount_entries_per_block;
+	u32 entry_index = host_cluster % q->refcount_entries_per_block;
+	struct lbd_refcount_cache_entry *e;
+
+	if (!q->refcount_table)
+		return -EINVAL;
+
+	/* Grow refcount table if needed */
+	if (block_index >= q->refcount_table_clusters) {
+		u32 new_size = block_index + 1;
+		u64 *new_table;
+		u32 i;
+
+		new_table = kvmalloc_array(new_size, sizeof(u64), GFP_NOIO);
+		if (!new_table)
+			return -ENOMEM;
+
+		if (q->refcount_table) {
+			memcpy(new_table, q->refcount_table,
+			       q->refcount_table_clusters * sizeof(u64));
+		}
+		for (i = q->refcount_table_clusters; i < new_size; i++)
+			new_table[i] = 0;
+
+		kvfree(q->refcount_table);
+		q->refcount_table = new_table;
+		q->refcount_table_clusters = new_size;
+	}
+
+	/* Allocate refcount block if needed */
+	if (q->refcount_table[block_index] == 0) {
+		loff_t block_phys = q->alloc_offset;
+		void *zeros;
+		loff_t pos;
+		ssize_t ret;
+
+		q->alloc_offset += q->cluster_size;
+
+		/* Write zeroed block to disk */
+		zeros = kvmalloc(q->cluster_size, GFP_NOIO);
+		if (!zeros)
+			return -ENOMEM;
+		memset(zeros, 0, q->cluster_size);
+		pos = block_phys;
+		ret = kernel_write(dev->backing_file, zeros,
+				   q->cluster_size, &pos);
+		kvfree(zeros);
+		if (ret != q->cluster_size)
+			return ret < 0 ? ret : -EIO;
+
+		q->refcount_table[block_index] = block_phys;
+
+		/* Invalidate any cached entry for this block */
+		{
+			int i;
+			for (i = 0; i < LBD_QCOW2_REFCOUNT_CACHE_SIZE; i++) {
+				struct lbd_refcount_cache_entry *ce =
+					&q->refcount_cache[i];
+				if (ce->valid && ce->block_index == block_index)
+					ce->valid = false;
+			}
+		}
+	}
+
+	e = lbd_qcow2_refcount_block_get(dev, block_index);
+	if (!e)
+		return -EIO;
+
+	e->entries[entry_index] = value;
+	e->dirty = true;
+	return 0;
+}
+
+/* Increment refcount for a host cluster, returns new value */
+static int lbd_qcow2_increment_refcount(struct lbd_device *dev,
+					 u64 host_cluster)
+{
+	u16 rc = lbd_qcow2_get_refcount(dev, host_cluster);
+
+	if (rc == 0xFFFF)
+		return -EOVERFLOW;
+
+	return lbd_qcow2_set_refcount(dev, host_cluster, rc + 1);
+}
+
+/* Decrement refcount for a host cluster, returns new value via *out */
+static int lbd_qcow2_decrement_refcount(struct lbd_device *dev,
+					 u64 host_cluster, u16 *out)
+{
+	u16 rc = lbd_qcow2_get_refcount(dev, host_cluster);
+	int err;
+
+	if (rc == 0) {
+		if (out) *out = 0;
+		return 0;
+	}
+
+	err = lbd_qcow2_set_refcount(dev, host_cluster, rc - 1);
+	if (err)
+		return err;
+
+	if (out)
+		*out = rc - 1;
+	return 0;
+}
+
+/* Flush all dirty refcount cache entries */
+static void lbd_qcow2_refcount_cache_flush(struct lbd_device *dev)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	int i;
+
+	for (i = 0; i < LBD_QCOW2_REFCOUNT_CACHE_SIZE; i++) {
+		struct lbd_refcount_cache_entry *e = &q->refcount_cache[i];
+		if (e->valid && e->dirty)
+			lbd_qcow2_refcount_block_flush(dev, e);
+	}
+}
+
+/* Write refcount table (array of u64 pointers) to disk */
+static int lbd_qcow2_write_refcount_table(struct lbd_device *dev)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	__be64 *disk_table;
+	loff_t pos;
+	ssize_t ret;
+	u32 i;
+	u32 table_bytes;
+
+	if (!q->refcount_table || q->refcount_table_clusters == 0)
+		return 0;
+
+	table_bytes = q->refcount_table_clusters * sizeof(u64);
+
+	disk_table = kvmalloc(table_bytes, GFP_NOIO);
+	if (!disk_table)
+		return -ENOMEM;
+
+	for (i = 0; i < q->refcount_table_clusters; i++)
+		disk_table[i] = cpu_to_be64(q->refcount_table[i]);
+
+	pos = q->refcount_table_offset;
+	ret = kernel_write(dev->backing_file, disk_table, table_bytes, &pos);
+	kvfree(disk_table);
+
+	if (ret != table_bytes)
+		return ret < 0 ? ret : -EIO;
+
+	return 0;
+}
+
+/* Forward declaration — defined later, needed by refcount init scan */
+static struct lbd_l2_cache_entry *
+lbd_qcow2_l2_get(struct lbd_device *dev, u32 l1_index);
+
+/*
+ * Initialize refcount table from scratch by scanning all L1/L2 tables.
+ * Called during first snapshot creation.
+ */
+static int lbd_qcow2_refcount_init_from_scan(struct lbd_device *dev)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	u32 i, j;
+	int err;
+
+	q->refcount_entries_per_block = q->cluster_size / sizeof(u16);
+
+	/* Allocate initial refcount table (empty, will grow as needed) */
+	q->refcount_table = kvmalloc_array(1, sizeof(u64), GFP_NOIO);
+	if (!q->refcount_table)
+		return -ENOMEM;
+	q->refcount_table[0] = 0;
+	q->refcount_table_clusters = 1;
+
+	/* Allocate space for refcount table on disk */
+	q->refcount_table_offset = q->alloc_offset;
+	q->alloc_offset += q->cluster_size; /* reserve at least one cluster */
+
+	/* Allocate refcount cache entries */
+	for (i = 0; i < LBD_QCOW2_REFCOUNT_CACHE_SIZE; i++) {
+		struct lbd_refcount_cache_entry *e = &q->refcount_cache[i];
+		if (!e->entries) {
+			e->entries = kvmalloc(q->cluster_size, GFP_NOIO);
+			if (!e->entries)
+				return -ENOMEM;
+		}
+		e->valid = false;
+		e->dirty = false;
+	}
+
+	/* Walk active L1/L2: increment refcount for each allocation */
+	for (i = 0; i < q->l1_size; i++) {
+		u64 l2_phys = q->l1_table[i];
+		struct lbd_l2_cache_entry *l2e;
+		u64 l2_host_cluster;
+
+		if (l2_phys == 0)
+			continue;
+
+		/* Increment refcount for the L2 table's host cluster */
+		l2_host_cluster = l2_phys / q->cluster_size;
+		err = lbd_qcow2_increment_refcount(dev, l2_host_cluster);
+		if (err)
+			return err;
+
+		/* Load L2 table and walk entries */
+		l2e = lbd_qcow2_l2_get(dev, i);
+		if (!l2e)
+			return -EIO;
+
+		for (j = 0; j < q->l2_entries; j++) {
+			u64 entry = l2e->table[j];
+			u64 phys, host_cluster;
+
+			if (entry == 0)
+				continue;
+
+			phys = entry & LBD_QCOW2_L2_OFFSET_MASK;
+			host_cluster = phys / q->cluster_size;
+			err = lbd_qcow2_increment_refcount(dev,
+							    host_cluster);
+			if (err)
+				return err;
+		}
+	}
+
+	/* Flush all refcount blocks to disk */
+	lbd_qcow2_refcount_cache_flush(dev);
+
+	/* Write refcount table to disk */
+	err = lbd_qcow2_write_refcount_table(dev);
+	if (err)
+		return err;
+
+	/* Write refcount header fields */
+	err = lbd_qcow2_write_refcount_header(dev);
+	if (err)
+		return err;
+
+	return 0;
 }
 
 /* Maximum number of free list entries to scan when allocating */
@@ -353,6 +806,81 @@ static int lbd_qcow2_l2_flush(struct lbd_device *dev,
 	return 0;
 }
 
+/*
+ * COW an L2 table if it is shared with a snapshot (refcount > 1).
+ * Must be called before modifying any L2 entry (write, discard).
+ */
+static int lbd_qcow2_l2_cow_if_needed(struct lbd_device *dev, u32 l1_index)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	u64 l2_phys, old_host, new_phys;
+	u16 rc;
+	struct lbd_l2_cache_entry *l2e;
+	__be64 *disk_l2;
+	loff_t pos;
+	ssize_t ret;
+	__be64 val;
+	int j, err;
+
+	if (!q->refcount_table || l1_index >= q->l1_size)
+		return 0;
+
+	l2_phys = q->l1_table[l1_index];
+	if (l2_phys == 0)
+		return 0;
+
+	old_host = l2_phys / q->cluster_size;
+	rc = lbd_qcow2_get_refcount(dev, old_host);
+	if (rc <= 1)
+		return 0;  /* not shared */
+
+	/* COW the L2 table: allocate new cluster */
+	new_phys = q->alloc_offset;
+	q->alloc_offset += q->cluster_size;
+
+	/* Load current L2 data */
+	l2e = lbd_qcow2_l2_get(dev, l1_index);
+	if (!l2e)
+		return -EIO;
+
+	/* Write L2 data to new location */
+	disk_l2 = kvmalloc(q->cluster_size, GFP_NOIO);
+	if (!disk_l2)
+		return -ENOMEM;
+
+	for (j = 0; j < q->l2_entries; j++)
+		disk_l2[j] = cpu_to_be64(l2e->table[j]);
+
+	pos = new_phys;
+	ret = kernel_write(dev->backing_file, disk_l2, q->cluster_size, &pos);
+	kvfree(disk_l2);
+	if (ret != q->cluster_size)
+		return ret < 0 ? ret : -EIO;
+
+	/* Update L1 entry to point to new location */
+	q->l1_table[l1_index] = new_phys;
+	val = cpu_to_be64(new_phys);
+	pos = q->l1_offset + (loff_t)l1_index * sizeof(__be64);
+	ret = kernel_write(dev->backing_file, &val, sizeof(val), &pos);
+	if (ret != sizeof(val))
+		return ret < 0 ? ret : -EIO;
+
+	/* Update cache entry to reflect new location */
+	/* (l2e is still the same cache entry, just update metadata) */
+
+	/* Update refcounts */
+	err = lbd_qcow2_decrement_refcount(dev, old_host, NULL);
+	if (err)
+		return err;
+
+	new_phys /= q->cluster_size;
+	err = lbd_qcow2_increment_refcount(dev, new_phys);
+	if (err)
+		return err;
+
+	return 0;
+}
+
 /* Allocate a new L2 table on disk if needed */
 static int lbd_qcow2_l2_alloc(struct lbd_device *dev, u32 l1_index)
 {
@@ -556,6 +1084,634 @@ lbd_qcow2_cl_load(struct lbd_device *dev, u64 cluster_index)
 }
 
 /* ----------------------------------------------------------------
+ * Snapshot create / delete
+ * ---------------------------------------------------------------- */
+
+/*
+ * Flush all dirty L2 cache entries to disk.
+ */
+static void lbd_qcow2_flush_all_l2(struct lbd_device *dev)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	int i;
+
+	for (i = 0; i < LBD_QCOW2_L2_CACHE_SIZE; i++) {
+		struct lbd_l2_cache_entry *e = &q->l2_cache[i];
+		if (e->valid && e->dirty)
+			lbd_qcow2_l2_flush(dev, e);
+	}
+}
+
+/*
+ * Set COW flag on all non-zero L2 entries in all allocated L2 tables.
+ */
+static int lbd_qcow2_set_cow_flags(struct lbd_device *dev)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	u32 i, j;
+
+	for (i = 0; i < q->l1_size; i++) {
+		struct lbd_l2_cache_entry *l2e;
+
+		if (q->l1_table[i] == 0)
+			continue;
+
+		l2e = lbd_qcow2_l2_get(dev, i);
+		if (!l2e)
+			return -EIO;
+
+		for (j = 0; j < q->l2_entries; j++) {
+			if (l2e->table[j] != 0) {
+				l2e->table[j] |= LBD_QCOW2_L2_COW;
+				l2e->dirty = true;
+			}
+		}
+
+		lbd_qcow2_l2_flush(dev, l2e);
+	}
+	return 0;
+}
+
+/*
+ * Clear COW flag on all L2 entries in all allocated L2 tables.
+ */
+static int lbd_qcow2_clear_cow_flags(struct lbd_device *dev)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	u32 i, j;
+
+	for (i = 0; i < q->l1_size; i++) {
+		struct lbd_l2_cache_entry *l2e;
+
+		if (q->l1_table[i] == 0)
+			continue;
+
+		l2e = lbd_qcow2_l2_get(dev, i);
+		if (!l2e)
+			return -EIO;
+
+		for (j = 0; j < q->l2_entries; j++) {
+			if (l2e->table[j] & LBD_QCOW2_L2_COW) {
+				l2e->table[j] &= ~LBD_QCOW2_L2_COW;
+				l2e->dirty = true;
+			}
+		}
+
+		lbd_qcow2_l2_flush(dev, l2e);
+	}
+	return 0;
+}
+
+/*
+ * Write a snapshot table entry to disk at the given offset.
+ * Returns the total bytes written (including alignment padding).
+ */
+static int lbd_qcow2_write_snap_entry(struct lbd_device *dev, loff_t offset,
+				       u32 snap_id, u64 l1_off, u32 l1_sz,
+				       u32 date_sec, u32 date_nsec,
+				       const char *name, u16 name_len)
+{
+	u8 buf[LBD_QCOW2_SNAP_FIXED_SIZE];
+	loff_t pos = offset;
+	ssize_t ret;
+	u32 padded_name_len;
+
+	_qcow2_put32(buf, 0, snap_id);
+	_qcow2_put64(buf, 4, l1_off);
+	_qcow2_put32(buf, 12, l1_sz);
+	_qcow2_put32(buf, 16, date_sec);
+	_qcow2_put32(buf, 20, date_nsec);
+	_qcow2_put16(buf, 24, name_len);
+
+	ret = kernel_write(dev->backing_file, buf, LBD_QCOW2_SNAP_FIXED_SIZE,
+			   &pos);
+	if (ret != LBD_QCOW2_SNAP_FIXED_SIZE)
+		return ret < 0 ? ret : -EIO;
+
+	/* Write name */
+	if (name_len > 0) {
+		ret = kernel_write(dev->backing_file, name, name_len, &pos);
+		if (ret != name_len)
+			return ret < 0 ? ret : -EIO;
+	}
+
+	/* Pad to 8-byte alignment */
+	padded_name_len = ALIGN(name_len, 8);
+	if (padded_name_len > name_len) {
+		u8 zeros[8] = {0};
+		u32 pad = padded_name_len - name_len;
+
+		ret = kernel_write(dev->backing_file, zeros, pad, &pos);
+		if (ret != pad)
+			return ret < 0 ? ret : -EIO;
+	}
+
+	return 0;
+}
+
+int lbd_qcow2_snapshot_create(struct lbd_device *dev, const char *name)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	u16 name_len;
+	u32 snap_id;
+	u64 l1_copy_offset;
+	u32 l1_bytes;
+	__be64 *disk_l1;
+	loff_t pos;
+	ssize_t ret;
+	struct timespec64 ts;
+	int err, i;
+
+	name_len = strlen(name);
+	if (name_len > LBD_QCOW2_SNAP_NAME_MAX)
+		return -ENAMETOOLONG;
+
+	down_write(&q->rwsem);
+
+	/* Step 1: Flush all dirty L2 cache entries */
+	lbd_qcow2_flush_all_l2(dev);
+
+	/* Step 2: Allocate space for L1 table copy */
+	l1_bytes = q->l1_size * sizeof(u64);
+	l1_copy_offset = q->alloc_offset;
+	q->alloc_offset += ALIGN(l1_bytes, q->cluster_size);
+
+	/* Step 3: Write current L1 table to copy location */
+	disk_l1 = kvmalloc_array(q->l1_size, sizeof(__be64), GFP_NOIO);
+	if (!disk_l1) {
+		up_write(&q->rwsem);
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < q->l1_size; i++)
+		disk_l1[i] = cpu_to_be64(q->l1_table[i]);
+
+	pos = l1_copy_offset;
+	ret = kernel_write(dev->backing_file, disk_l1, l1_bytes, &pos);
+	kvfree(disk_l1);
+	if (ret != l1_bytes) {
+		up_write(&q->rwsem);
+		return ret < 0 ? ret : -EIO;
+	}
+
+	/* Step 4: Initialize refcount table if first snapshot */
+	if (!q->refcount_table) {
+		err = lbd_qcow2_refcount_init_from_scan(dev);
+		if (err) {
+			up_write(&q->rwsem);
+			return err;
+		}
+		q->incompatible_features |= LBD_QCOW2_FEAT_REFCOUNTS |
+					     LBD_QCOW2_FEAT_SNAPSHOTS;
+		lbd_qcow2_write_incompat_features(dev);
+	} else {
+		/* Step 5: Subsequent snapshot - bump refcounts for active data */
+		for (i = 0; i < q->l1_size; i++) {
+			struct lbd_l2_cache_entry *l2e;
+			u64 l2_phys = q->l1_table[i];
+			u32 j;
+
+			if (l2_phys == 0)
+				continue;
+
+			/* Increment refcount for L2 table's host cluster */
+			err = lbd_qcow2_increment_refcount(dev,
+				l2_phys / q->cluster_size);
+			if (err) {
+				up_write(&q->rwsem);
+				return err;
+			}
+
+			l2e = lbd_qcow2_l2_get(dev, i);
+			if (!l2e) {
+				up_write(&q->rwsem);
+				return -EIO;
+			}
+
+			for (j = 0; j < q->l2_entries; j++) {
+				u64 entry = l2e->table[j];
+				u64 phys;
+
+				if (entry == 0)
+					continue;
+
+				phys = entry & LBD_QCOW2_L2_OFFSET_MASK;
+				err = lbd_qcow2_increment_refcount(dev,
+					phys / q->cluster_size);
+				if (err) {
+					up_write(&q->rwsem);
+					return err;
+				}
+			}
+		}
+	}
+
+	/* Step 6: Set COW flag on all non-zero active L2 entries */
+	err = lbd_qcow2_set_cow_flags(dev);
+	if (err) {
+		up_write(&q->rwsem);
+		return err;
+	}
+
+	/* Step 7: Append snapshot entry to snapshot table */
+	snap_id = q->next_snapshot_id++;
+	ktime_get_real_ts64(&ts);
+
+	if (q->snapshot_table_offset == 0) {
+		q->snapshot_table_offset = q->alloc_offset;
+		q->alloc_offset += q->cluster_size;
+	}
+
+	{
+		/* Calculate position: walk existing entries to find end */
+		u32 entry_size = LBD_QCOW2_SNAP_FIXED_SIZE + ALIGN(name_len, 8);
+		loff_t snap_pos = q->snapshot_table_offset;
+		u32 s;
+
+		/* Skip existing snapshot entries */
+		for (s = 0; s < q->snapshot_count; s++) {
+			u8 hdr_buf[LBD_QCOW2_SNAP_FIXED_SIZE];
+			u16 existing_name_len;
+
+			pos = snap_pos;
+			ret = kernel_read(dev->backing_file, hdr_buf,
+					  LBD_QCOW2_SNAP_FIXED_SIZE, &pos);
+			if (ret != LBD_QCOW2_SNAP_FIXED_SIZE) {
+				up_write(&q->rwsem);
+				return -EIO;
+			}
+			existing_name_len = _qcow2_get16(hdr_buf, 24);
+			snap_pos += LBD_QCOW2_SNAP_FIXED_SIZE +
+				    ALIGN(existing_name_len, 8);
+		}
+
+		err = lbd_qcow2_write_snap_entry(dev, snap_pos, snap_id,
+						  l1_copy_offset, q->l1_size,
+						  (u32)ts.tv_sec,
+						  (u32)ts.tv_nsec,
+						  name, name_len);
+		if (err) {
+			up_write(&q->rwsem);
+			return err;
+		}
+
+		(void)entry_size;
+	}
+
+	/* Step 8: Update snapshot count and header */
+	q->snapshot_count++;
+
+	/* Flush refcount cache */
+	lbd_qcow2_refcount_cache_flush(dev);
+	lbd_qcow2_write_refcount_table(dev);
+	lbd_qcow2_write_refcount_header(dev);
+
+	lbd_qcow2_write_snapshot_header(dev);
+	lbd_qcow2_write_alloc_offset(dev);
+
+	pr_info("lbd%d: snapshot '%s' created (id=%u)\n",
+		dev->index, name, snap_id);
+
+	up_write(&q->rwsem);
+	return 0;
+}
+
+int lbd_qcow2_snapshot_delete(struct lbd_device *dev, u32 snapshot_id)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	loff_t snap_pos;
+	u32 s, found_idx = U32_MAX;
+	u64 snap_l1_offset = 0;
+	u32 snap_l1_size = 0;
+	u64 *snap_l1 = NULL;
+	__be64 *disk_l1 = NULL;
+	int err = 0;
+	u32 i, j;
+
+	down_write(&q->rwsem);
+
+	if (q->snapshot_count == 0) {
+		up_write(&q->rwsem);
+		return -ENOENT;
+	}
+
+	/* Find the snapshot entry */
+	snap_pos = q->snapshot_table_offset;
+	for (s = 0; s < q->snapshot_count; s++) {
+		u8 hdr_buf[LBD_QCOW2_SNAP_FIXED_SIZE];
+		u32 sid;
+		u16 nlen;
+		loff_t pos = snap_pos;
+		ssize_t ret;
+
+		ret = kernel_read(dev->backing_file, hdr_buf,
+				  LBD_QCOW2_SNAP_FIXED_SIZE, &pos);
+		if (ret != LBD_QCOW2_SNAP_FIXED_SIZE) {
+			err = -EIO;
+			goto out;
+		}
+
+		sid = _qcow2_get32(hdr_buf, 0);
+		nlen = _qcow2_get16(hdr_buf, 24);
+
+		if (sid == snapshot_id) {
+			found_idx = s;
+			snap_l1_offset = _qcow2_get64(hdr_buf, 4);
+			snap_l1_size = _qcow2_get32(hdr_buf, 12);
+			break;
+		}
+
+		snap_pos += LBD_QCOW2_SNAP_FIXED_SIZE + ALIGN(nlen, 8);
+	}
+
+	if (found_idx == U32_MAX) {
+		err = -ENOENT;
+		goto out;
+	}
+
+	/* Load the snapshot's L1 table */
+	snap_l1 = kvmalloc_array(snap_l1_size, sizeof(u64), GFP_NOIO);
+	if (!snap_l1) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	disk_l1 = kvmalloc_array(snap_l1_size, sizeof(__be64), GFP_NOIO);
+	if (!disk_l1) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	{
+		loff_t pos = snap_l1_offset;
+		ssize_t ret = kernel_read(dev->backing_file, disk_l1,
+					  snap_l1_size * sizeof(__be64), &pos);
+		if (ret != snap_l1_size * sizeof(__be64)) {
+			err = ret < 0 ? ret : -EIO;
+			goto out;
+		}
+	}
+
+	for (i = 0; i < snap_l1_size; i++)
+		snap_l1[i] = be64_to_cpu(disk_l1[i]);
+	kvfree(disk_l1);
+	disk_l1 = NULL;
+
+	/* Walk snapshot's L2 tables and decrement refcounts */
+	for (i = 0; i < snap_l1_size; i++) {
+		u64 l2_phys = snap_l1[i];
+		__be64 *snap_l2_disk;
+		u64 *snap_l2;
+		u16 new_rc;
+		loff_t pos;
+		ssize_t ret;
+
+		if (l2_phys == 0)
+			continue;
+
+		/* Read the snapshot's L2 table from disk */
+		snap_l2_disk = kvmalloc(q->cluster_size, GFP_NOIO);
+		if (!snap_l2_disk) {
+			err = -ENOMEM;
+			goto out;
+		}
+		snap_l2 = kvmalloc(q->cluster_size, GFP_NOIO);
+		if (!snap_l2) {
+			kvfree(snap_l2_disk);
+			err = -ENOMEM;
+			goto out;
+		}
+
+		pos = l2_phys;
+		ret = kernel_read(dev->backing_file, snap_l2_disk,
+				  q->cluster_size, &pos);
+		if (ret != q->cluster_size) {
+			kvfree(snap_l2);
+			kvfree(snap_l2_disk);
+			err = ret < 0 ? ret : -EIO;
+			goto out;
+		}
+
+		for (j = 0; j < q->l2_entries; j++)
+			snap_l2[j] = be64_to_cpu(snap_l2_disk[j]);
+		kvfree(snap_l2_disk);
+
+		/* Decrement refcount for each data cluster */
+		for (j = 0; j < q->l2_entries; j++) {
+			u64 entry = snap_l2[j];
+			u64 phys;
+
+			if (entry == 0)
+				continue;
+
+			phys = entry & LBD_QCOW2_L2_OFFSET_MASK;
+			err = lbd_qcow2_decrement_refcount(dev,
+				phys / q->cluster_size, &new_rc);
+			if (err) {
+				kvfree(snap_l2);
+				goto out;
+			}
+
+			if (new_rc == 0) {
+				/* Host cluster is now free */
+				u64 old_sz = lbd_qcow2_read_old_alloc_size(
+						dev, entry);
+				if (old_sz > 0)
+					lbd_qcow2_free_extent(dev, phys,
+							      old_sz);
+			}
+		}
+
+		kvfree(snap_l2);
+
+		/* Decrement refcount for the L2 table itself */
+		err = lbd_qcow2_decrement_refcount(dev,
+			l2_phys / q->cluster_size, &new_rc);
+		if (err)
+			goto out;
+
+		if (new_rc == 0) {
+			lbd_qcow2_free_extent(dev, l2_phys, q->cluster_size);
+		}
+	}
+
+	/* Free the snapshot's L1 table cluster(s) */
+	{
+		u64 l1_bytes = ALIGN((u64)snap_l1_size * sizeof(u64),
+				     q->cluster_size);
+		lbd_qcow2_free_extent(dev, snap_l1_offset, l1_bytes);
+	}
+
+	/* Remove snapshot entry from table by compacting */
+	{
+		/* Re-read all snapshot entries, skip the deleted one, rewrite */
+		u8 *snap_table_buf;
+		loff_t read_pos, write_pos;
+		u32 total_entries = q->snapshot_count;
+
+		snap_table_buf = kvmalloc(q->cluster_size, GFP_NOIO);
+		if (!snap_table_buf) {
+			err = -ENOMEM;
+			goto out;
+		}
+
+		read_pos = q->snapshot_table_offset;
+		write_pos = q->snapshot_table_offset;
+
+		for (s = 0; s < total_entries; s++) {
+			u8 hdr_buf[LBD_QCOW2_SNAP_FIXED_SIZE];
+			u16 nlen;
+			u32 entry_total;
+			loff_t rp = read_pos;
+			ssize_t ret;
+
+			ret = kernel_read(dev->backing_file, hdr_buf,
+					  LBD_QCOW2_SNAP_FIXED_SIZE, &rp);
+			if (ret != LBD_QCOW2_SNAP_FIXED_SIZE) {
+				kvfree(snap_table_buf);
+				err = -EIO;
+				goto out;
+			}
+
+			nlen = _qcow2_get16(hdr_buf, 24);
+			entry_total = LBD_QCOW2_SNAP_FIXED_SIZE +
+				      ALIGN(nlen, 8);
+
+			if (s == found_idx) {
+				/* Skip this entry */
+				read_pos += entry_total;
+				continue;
+			}
+
+			if (write_pos != read_pos) {
+				/* Read entire entry and write to new position */
+				u8 *entry_buf = kvmalloc(entry_total, GFP_NOIO);
+				if (!entry_buf) {
+					kvfree(snap_table_buf);
+					err = -ENOMEM;
+					goto out;
+				}
+
+				rp = read_pos;
+				ret = kernel_read(dev->backing_file, entry_buf,
+						  entry_total, &rp);
+				if (ret != entry_total) {
+					kvfree(entry_buf);
+					kvfree(snap_table_buf);
+					err = -EIO;
+					goto out;
+				}
+
+				rp = write_pos;
+				ret = kernel_write(dev->backing_file, entry_buf,
+						   entry_total, &rp);
+				kvfree(entry_buf);
+				if (ret != entry_total) {
+					kvfree(snap_table_buf);
+					err = ret < 0 ? ret : -EIO;
+					goto out;
+				}
+			}
+
+			write_pos += entry_total;
+			read_pos += entry_total;
+		}
+
+		kvfree(snap_table_buf);
+	}
+
+	q->snapshot_count--;
+
+	/* If no more snapshots, clear COW flags */
+	if (q->snapshot_count == 0) {
+		lbd_qcow2_clear_cow_flags(dev);
+	}
+
+	/* Flush and persist metadata */
+	lbd_qcow2_refcount_cache_flush(dev);
+	lbd_qcow2_write_refcount_table(dev);
+	lbd_qcow2_write_snapshot_header(dev);
+	lbd_qcow2_write_alloc_offset(dev);
+
+	pr_info("lbd%d: snapshot id=%u deleted (%u remaining)\n",
+		dev->index, snapshot_id, q->snapshot_count);
+
+out:
+	kvfree(snap_l1);
+	kvfree(disk_l1);
+	up_write(&q->rwsem);
+	return err;
+}
+
+int lbd_qcow2_snapshot_list(struct lbd_device *dev, void __user *buf,
+			    u32 buf_size, u32 *count_out)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	loff_t snap_pos;
+	u32 s;
+
+	down_read(&q->rwsem);
+
+	*count_out = q->snapshot_count;
+
+	if (buf && buf_size > 0) {
+		snap_pos = q->snapshot_table_offset;
+		for (s = 0; s < q->snapshot_count && buf_size > 0; s++) {
+			u8 hdr_buf[LBD_QCOW2_SNAP_FIXED_SIZE];
+			u16 nlen;
+			u32 entry_total;
+			loff_t pos = snap_pos;
+			ssize_t ret;
+			u32 to_copy;
+
+			ret = kernel_read(dev->backing_file, hdr_buf,
+					  LBD_QCOW2_SNAP_FIXED_SIZE, &pos);
+			if (ret != LBD_QCOW2_SNAP_FIXED_SIZE) {
+				up_read(&q->rwsem);
+				return -EIO;
+			}
+
+			nlen = _qcow2_get16(hdr_buf, 24);
+			entry_total = LBD_QCOW2_SNAP_FIXED_SIZE +
+				      ALIGN(nlen, 8);
+
+			to_copy = min_t(u32, entry_total, buf_size);
+			/* Read entire entry and copy to user */
+			{
+				u8 *entry_buf = kvmalloc(entry_total, GFP_NOIO);
+				if (!entry_buf) {
+					up_read(&q->rwsem);
+					return -ENOMEM;
+				}
+
+				pos = snap_pos;
+				ret = kernel_read(dev->backing_file, entry_buf,
+						  entry_total, &pos);
+				if (ret != entry_total) {
+					kvfree(entry_buf);
+					up_read(&q->rwsem);
+					return -EIO;
+				}
+
+				if (copy_to_user(buf, entry_buf, to_copy)) {
+					kvfree(entry_buf);
+					up_read(&q->rwsem);
+					return -EFAULT;
+				}
+				kvfree(entry_buf);
+			}
+
+			buf += to_copy;
+			buf_size -= to_copy;
+			snap_pos += entry_total;
+		}
+	}
+
+	up_read(&q->rwsem);
+	return 0;
+}
+
+/* ----------------------------------------------------------------
  * Init / Destroy
  * ---------------------------------------------------------------- */
 
@@ -608,6 +1764,12 @@ int lbd_qcow2_init(struct lbd_device *dev)
 	q->l1_size = lbd_qcow2_hdr_l1_size(hdr);
 	q->alloc_offset = lbd_qcow2_hdr_alloc_offset(hdr);
 	q->free_list_head = lbd_qcow2_hdr_free_list(hdr);
+	q->incompatible_features = lbd_qcow2_hdr_incompat_feat(hdr);
+	q->refcount_table_offset = lbd_qcow2_hdr_refcount_table(hdr);
+	q->refcount_table_clusters = lbd_qcow2_hdr_refcount_clusters(hdr);
+	q->snapshot_table_offset = lbd_qcow2_hdr_snapshot_table(hdr);
+	q->snapshot_count = lbd_qcow2_hdr_snapshot_count(hdr);
+	q->refcount_entries_per_block = q->cluster_size / sizeof(u16);
 	q->lru_tick = 0;
 
 	kvfree(hdr);
@@ -676,12 +1838,94 @@ int lbd_qcow2_init(struct lbd_device *dev)
 		goto err_cl_cache;
 	}
 
+	/* Allocate refcount cache entries */
+	for (i = 0; i < LBD_QCOW2_REFCOUNT_CACHE_SIZE; i++) {
+		struct lbd_refcount_cache_entry *e = &q->refcount_cache[i];
+
+		e->entries = kvmalloc(q->cluster_size, GFP_KERNEL);
+		if (!e->entries)
+			goto err_refcount_cache;
+		e->valid = false;
+		e->dirty = false;
+	}
+
+	/* Load refcount table from disk if present */
+	if (q->incompatible_features & LBD_QCOW2_FEAT_REFCOUNTS) {
+		size_t rt_bytes = (size_t)q->refcount_table_clusters * sizeof(u64);
+		__be64 *disk_rt;
+
+		q->refcount_table = kvmalloc_array(q->refcount_table_clusters,
+						   sizeof(u64), GFP_KERNEL);
+		if (!q->refcount_table)
+			goto err_refcount_cache;
+
+		disk_rt = kvmalloc(rt_bytes, GFP_KERNEL);
+		if (!disk_rt) {
+			kvfree(q->refcount_table);
+			q->refcount_table = NULL;
+			goto err_refcount_cache;
+		}
+
+		pos = q->refcount_table_offset;
+		ret = kernel_read(dev->backing_file, disk_rt, rt_bytes, &pos);
+		if (ret != (ssize_t)rt_bytes) {
+			pr_err("lbd%d: refcount table read failed\n",
+			       dev->index);
+			kvfree(disk_rt);
+			kvfree(q->refcount_table);
+			q->refcount_table = NULL;
+			goto err_refcount_cache;
+		}
+
+		for (i = 0; i < (int)q->refcount_table_clusters; i++)
+			q->refcount_table[i] = be64_to_cpu(disk_rt[i]);
+		kvfree(disk_rt);
+	}
+
+	/* Determine next_snapshot_id from existing snapshots */
+	if (q->snapshot_count > 0) {
+		loff_t snap_pos = q->snapshot_table_offset;
+		u8 entry_hdr[LBD_QCOW2_SNAP_FIXED_SIZE];
+		u32 max_id = 0;
+
+		for (i = 0; i < (int)q->snapshot_count; i++) {
+			u32 snap_id;
+			u16 name_len;
+			u32 total_entry;
+
+			pos = snap_pos;
+			ret = kernel_read(dev->backing_file, entry_hdr,
+					  LBD_QCOW2_SNAP_FIXED_SIZE, &pos);
+			if (ret != LBD_QCOW2_SNAP_FIXED_SIZE)
+				break;
+
+			snap_id = _qcow2_get32(entry_hdr, 0);
+			name_len = _qcow2_get16(entry_hdr, 24);
+			if (snap_id > max_id)
+				max_id = snap_id;
+
+			total_entry = LBD_QCOW2_SNAP_FIXED_SIZE + name_len;
+			total_entry = (total_entry + 7) & ~7U;
+			snap_pos += total_entry;
+		}
+		q->next_snapshot_id = max_id + 1;
+	} else {
+		q->next_snapshot_id = 1;
+	}
+
 	pr_info("lbd%d: qcow2-lz4 format detected, virtual_size=%llu, "
 		"cluster_size=%u, l1_size=%u\n",
 		dev->index, q->virtual_size, q->cluster_size, q->l1_size);
 
 	return 0;
 
+err_refcount_cache:
+	kvfree(q->refcount_table);
+	q->refcount_table = NULL;
+	for (i = 0; i < LBD_QCOW2_REFCOUNT_CACHE_SIZE; i++)
+		kvfree(q->refcount_cache[i].entries);
+	kvfree(q->read_buf);
+	kvfree(q->comp_buf);
 err_cl_cache:
 	for (i = 0; i < LBD_QCOW2_CL_CACHE_SIZE; i++)
 		kvfree(q->cl_cache[i].data);
@@ -706,9 +1950,21 @@ void lbd_qcow2_destroy(struct lbd_device *dev)
 			lbd_qcow2_l2_flush(dev, e);
 	}
 
+	/* Flush refcount cache and write refcount table */
+	if (q->refcount_table) {
+		lbd_qcow2_refcount_cache_flush(dev);
+		lbd_qcow2_write_refcount_table(dev);
+	}
+
 	/* Write final alloc_offset and free_list_head */
 	lbd_qcow2_write_alloc_offset(dev);
 	lbd_qcow2_write_free_list_head(dev);
+
+	/* Free refcount resources */
+	for (i = 0; i < LBD_QCOW2_REFCOUNT_CACHE_SIZE; i++)
+		kvfree(q->refcount_cache[i].entries);
+	kvfree(q->refcount_table);
+	q->refcount_table = NULL;
 
 	kvfree(q->read_buf);
 	kvfree(q->comp_buf);
@@ -820,6 +2076,14 @@ int lbd_qcow2_write(struct lbd_device *dev, struct request *rq)
 		u64 old_l2_entry;
 		u64 old_alloc, new_alloc;
 
+		/* COW L2 table if shared with snapshot */
+		err = lbd_qcow2_l2_cow_if_needed(dev, l1_idx);
+		if (err) {
+			up_write(&q->rwsem);
+			kvfree(write_data);
+			return err;
+		}
+
 		/* Ensure L2 table is allocated */
 		err = lbd_qcow2_l2_alloc(dev, l1_idx);
 		if (err) {
@@ -859,14 +2123,21 @@ int lbd_qcow2_write(struct lbd_device *dev, struct request *rq)
 		    (u32)comp_len < q->cluster_size - sizeof(__be32)) {
 			/* Store compressed */
 			__be32 comp_size_be = cpu_to_be32(comp_len);
-			new_alloc = ALIGN(sizeof(__be32) + comp_len, 512);
+			new_alloc = ALIGN(sizeof(__be32) + comp_len, 4096);
 
-			/* Try in-place rewrite if old allocation is big enough */
-			if (old_alloc > 0 && new_alloc <= old_alloc) {
+			if (old_l2_entry & LBD_QCOW2_L2_COW) {
+				/* Shared with snapshot — must COW */
+				err = lbd_qcow2_alloc_space(dev, new_alloc,
+							    &phys);
+				if (err) {
+					up_write(&q->rwsem);
+					kvfree(write_data);
+					return err;
+				}
+			} else if (old_alloc > 0 && new_alloc <= old_alloc) {
 				phys = old_l2_entry & LBD_QCOW2_L2_OFFSET_MASK;
 				atomic64_inc(&dev->stat_alloc_reused);
 			} else {
-				/* Free old extent if it exists */
 				if (old_alloc > 0) {
 					loff_t old_phys = old_l2_entry &
 						LBD_QCOW2_L2_OFFSET_MASK;
@@ -878,7 +2149,6 @@ int lbd_qcow2_write(struct lbd_device *dev, struct request *rq)
 						return err;
 					}
 				}
-				/* Allocate new space */
 				err = lbd_qcow2_alloc_space(dev, new_alloc,
 							    &phys);
 				if (err) {
@@ -910,6 +2180,7 @@ int lbd_qcow2_write(struct lbd_device *dev, struct request *rq)
 				}
 			}
 
+			/* Clear COW flag on new entry */
 			l2e->table[l2_idx] = LBD_QCOW2_L2_COMPRESSED | phys;
 			l2e->dirty = true;
 			atomic64_inc(&dev->stat_compressed);
@@ -917,12 +2188,19 @@ int lbd_qcow2_write(struct lbd_device *dev, struct request *rq)
 			/* Store uncompressed */
 			new_alloc = q->cluster_size;
 
-			/* Try in-place rewrite if old allocation is big enough */
-			if (old_alloc > 0 && new_alloc <= old_alloc) {
+			if (old_l2_entry & LBD_QCOW2_L2_COW) {
+				/* Shared with snapshot — must COW */
+				err = lbd_qcow2_alloc_space(dev, new_alloc,
+							    &phys);
+				if (err) {
+					up_write(&q->rwsem);
+					kvfree(write_data);
+					return err;
+				}
+			} else if (old_alloc > 0 && new_alloc <= old_alloc) {
 				phys = old_l2_entry & LBD_QCOW2_L2_OFFSET_MASK;
 				atomic64_inc(&dev->stat_alloc_reused);
 			} else {
-				/* Free old extent if it exists */
 				if (old_alloc > 0) {
 					loff_t old_phys = old_l2_entry &
 						LBD_QCOW2_L2_OFFSET_MASK;
@@ -934,7 +2212,6 @@ int lbd_qcow2_write(struct lbd_device *dev, struct request *rq)
 						return err;
 					}
 				}
-				/* Allocate new space */
 				err = lbd_qcow2_alloc_space(dev, new_alloc,
 							    &phys);
 				if (err) {
@@ -1008,21 +2285,33 @@ int lbd_qcow2_discard(struct lbd_device *dev, struct request *rq)
 		u32 l2_idx = cluster_idx % q->l2_entries;
 		struct lbd_l2_cache_entry *l2e;
 
+		/* COW L2 table if shared with snapshot */
+		err = lbd_qcow2_l2_cow_if_needed(dev, l1_idx);
+		if (err) {
+			up_write(&q->rwsem);
+			return err;
+		}
+
 		if (off_in_cluster == 0 && bytes == q->cluster_size) {
-			/* Full-cluster trim: free old extent and zero the L2 entry */
+			/* Full-cluster trim */
 			if (l1_idx < q->l1_size &&
 			    q->l1_table[l1_idx] != 0) {
 				l2e = lbd_qcow2_l2_get(dev, l1_idx);
 				if (l2e && l2e->table[l2_idx] != 0) {
 					u64 old_l2 = l2e->table[l2_idx];
-					u64 old_sz = lbd_qcow2_read_old_alloc_size(
-							dev, old_l2);
-					if (old_sz > 0) {
-						loff_t old_phys = old_l2 &
-							LBD_QCOW2_L2_OFFSET_MASK;
-						lbd_qcow2_free_extent(dev,
-							old_phys, old_sz);
+
+					if (!(old_l2 & LBD_QCOW2_L2_COW)) {
+						/* Not shared: free old extent */
+						u64 old_sz = lbd_qcow2_read_old_alloc_size(
+								dev, old_l2);
+						if (old_sz > 0) {
+							loff_t old_phys = old_l2 &
+								LBD_QCOW2_L2_OFFSET_MASK;
+							lbd_qcow2_free_extent(dev,
+								old_phys, old_sz);
+						}
 					}
+					/* COW-flagged: don't free, snapshot refs it */
 					l2e->table[l2_idx] = 0;
 					l2e->dirty = true;
 					err = lbd_qcow2_l2_flush(dev, l2e);
@@ -1049,7 +2338,6 @@ int lbd_qcow2_discard(struct lbd_device *dev, struct request *rq)
 				return -EIO;
 			}
 
-			/* Check if cluster is all zeros (unallocated) */
 			l2e = lbd_qcow2_l2_get(dev, l1_idx);
 			if (!l2e) {
 				up_write(&q->rwsem);
@@ -1057,14 +2345,13 @@ int lbd_qcow2_discard(struct lbd_device *dev, struct request *rq)
 			}
 
 			if (l2e->table[l2_idx] == 0) {
-				/* Already unallocated, nothing to do */
 				goto next;
 			}
 
 			/* Zero the trimmed portion */
 			memset(ce->data + off_in_cluster, 0, bytes);
 
-			/* Recompress and write back with space reuse */
+			/* Recompress and write back */
 			{
 				int comp_len;
 				loff_t phys;
@@ -1082,9 +2369,16 @@ int lbd_qcow2_discard(struct lbd_device *dev, struct request *rq)
 				if (comp_len > 0 &&
 				    (u32)comp_len < q->cluster_size - sizeof(__be32)) {
 					__be32 comp_size_be = cpu_to_be32(comp_len);
-					new_alloc = ALIGN(sizeof(__be32) + comp_len, 512);
+					new_alloc = ALIGN(sizeof(__be32) + comp_len, 4096);
 
-					if (old_alloc > 0 && new_alloc <= old_alloc) {
+					if (old_l2 & LBD_QCOW2_L2_COW) {
+						err = lbd_qcow2_alloc_space(dev,
+							new_alloc, &phys);
+						if (err) {
+							up_write(&q->rwsem);
+							return err;
+						}
+					} else if (old_alloc > 0 && new_alloc <= old_alloc) {
 						phys = old_l2 & LBD_QCOW2_L2_OFFSET_MASK;
 						atomic64_inc(&dev->stat_alloc_reused);
 					} else {
@@ -1125,7 +2419,14 @@ int lbd_qcow2_discard(struct lbd_device *dev, struct request *rq)
 				} else {
 					new_alloc = q->cluster_size;
 
-					if (old_alloc > 0 && new_alloc <= old_alloc) {
+					if (old_l2 & LBD_QCOW2_L2_COW) {
+						err = lbd_qcow2_alloc_space(dev,
+							new_alloc, &phys);
+						if (err) {
+							up_write(&q->rwsem);
+							return err;
+						}
+					} else if (old_alloc > 0 && new_alloc <= old_alloc) {
 						phys = old_l2 & LBD_QCOW2_L2_OFFSET_MASK;
 						atomic64_inc(&dev->stat_alloc_reused);
 					} else {

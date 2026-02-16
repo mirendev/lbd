@@ -29,13 +29,33 @@
 #define LBD_QCOW2_OFF_COMP_TYPE	44	/* u32 */
 #define LBD_QCOW2_OFF_FREE_LIST	48	/* u64 */
 
+/* New header fields (offset 56+) */
+#define LBD_QCOW2_OFF_INCOMPAT_FEAT	56	/* u64 */
+#define LBD_QCOW2_OFF_REFCOUNT_TABLE	64	/* u64 */
+#define LBD_QCOW2_OFF_REFCOUNT_CLUSTERS	72	/* u32 */
+#define LBD_QCOW2_OFF_SNAPSHOT_TABLE	76	/* u64 */
+#define LBD_QCOW2_OFF_SNAPSHOT_COUNT	84	/* u32 */
+
+/* Incompatible feature bits */
+#define LBD_QCOW2_FEAT_REFCOUNTS	(1ULL << 0)
+#define LBD_QCOW2_FEAT_SNAPSHOTS	(1ULL << 1)
+
 /* Free list tombstone marker */
 #define LBD_QCOW2_FREE_TOMBSTONE	0xDEADF4EEU
 
 /* L2 entry flags */
 #define LBD_QCOW2_L2_COMPRESSED	(1ULL << 63)
-#define LBD_QCOW2_L2_RESERVED		(1ULL << 62)
+#define LBD_QCOW2_L2_COW		(1ULL << 62)
 #define LBD_QCOW2_L2_OFFSET_MASK	0x3FFFFFFFFFFFFFFFULL
+
+/* Snapshot table entry field sizes */
+#define LBD_QCOW2_SNAP_ID_SIZE		4	/* u32 snapshot_id */
+#define LBD_QCOW2_SNAP_L1_OFF_SIZE	8	/* u64 l1_offset */
+#define LBD_QCOW2_SNAP_L1_SIZE_SIZE	4	/* u32 l1_size */
+#define LBD_QCOW2_SNAP_DATE_SEC_SIZE	4	/* u32 date_sec */
+#define LBD_QCOW2_SNAP_DATE_NSEC_SIZE	4	/* u32 date_nsec */
+#define LBD_QCOW2_SNAP_NAME_LEN_SIZE	2	/* u16 name_len */
+#define LBD_QCOW2_SNAP_FIXED_SIZE	26	/* sum of fixed fields */
 
 /* Default cluster parameters */
 #define LBD_QCOW2_CLUSTER_BITS_DEFAULT	16  /* 64 KiB clusters */
@@ -81,6 +101,21 @@ static inline void _qcow2_put32(void *buf, int off, _qcow2_u32 val)
 	memcpy((u8 *)buf + off, &v, 4);
 }
 
+typedef u16 _qcow2_u16;
+
+static inline _qcow2_u16 _qcow2_get16(const void *buf, int off)
+{
+	__be16 v;
+	memcpy(&v, (const u8 *)buf + off, 2);
+	return be16_to_cpu(v);
+}
+
+static inline void _qcow2_put16(void *buf, int off, _qcow2_u16 val)
+{
+	__be16 v = cpu_to_be16(val);
+	memcpy((u8 *)buf + off, &v, 2);
+}
+
 #else /* userspace */
 
 #include <stdint.h>
@@ -120,6 +155,20 @@ static inline void _qcow2_put32(void *buf, int off, _qcow2_u32 val)
 	uint8_t *p = (uint8_t *)buf + off;
 	p[0] = (uint8_t)(val >> 24); p[1] = (uint8_t)(val >> 16);
 	p[2] = (uint8_t)(val >>  8); p[3] = (uint8_t)val;
+}
+
+typedef uint16_t _qcow2_u16;
+
+static inline _qcow2_u16 _qcow2_get16(const void *buf, int off)
+{
+	const uint8_t *p = (const uint8_t *)buf + off;
+	return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
+}
+
+static inline void _qcow2_put16(void *buf, int off, _qcow2_u16 val)
+{
+	uint8_t *p = (uint8_t *)buf + off;
+	p[0] = (uint8_t)(val >> 8); p[1] = (uint8_t)val;
 }
 
 #endif /* __KERNEL__ */
@@ -220,6 +269,58 @@ static inline void lbd_qcow2_hdr_set_comp_type(void *h, _qcow2_u32 v)
 static inline void lbd_qcow2_hdr_set_free_list(void *h, _qcow2_u64 v)
 {
 	_qcow2_put64(h, LBD_QCOW2_OFF_FREE_LIST, v);
+}
+
+/* New field getters */
+static inline _qcow2_u64 lbd_qcow2_hdr_incompat_feat(const void *h)
+{
+	return _qcow2_get64(h, LBD_QCOW2_OFF_INCOMPAT_FEAT);
+}
+
+static inline _qcow2_u64 lbd_qcow2_hdr_refcount_table(const void *h)
+{
+	return _qcow2_get64(h, LBD_QCOW2_OFF_REFCOUNT_TABLE);
+}
+
+static inline _qcow2_u32 lbd_qcow2_hdr_refcount_clusters(const void *h)
+{
+	return _qcow2_get32(h, LBD_QCOW2_OFF_REFCOUNT_CLUSTERS);
+}
+
+static inline _qcow2_u64 lbd_qcow2_hdr_snapshot_table(const void *h)
+{
+	return _qcow2_get64(h, LBD_QCOW2_OFF_SNAPSHOT_TABLE);
+}
+
+static inline _qcow2_u32 lbd_qcow2_hdr_snapshot_count(const void *h)
+{
+	return _qcow2_get32(h, LBD_QCOW2_OFF_SNAPSHOT_COUNT);
+}
+
+/* New field setters */
+static inline void lbd_qcow2_hdr_set_incompat_feat(void *h, _qcow2_u64 v)
+{
+	_qcow2_put64(h, LBD_QCOW2_OFF_INCOMPAT_FEAT, v);
+}
+
+static inline void lbd_qcow2_hdr_set_refcount_table(void *h, _qcow2_u64 v)
+{
+	_qcow2_put64(h, LBD_QCOW2_OFF_REFCOUNT_TABLE, v);
+}
+
+static inline void lbd_qcow2_hdr_set_refcount_clusters(void *h, _qcow2_u32 v)
+{
+	_qcow2_put32(h, LBD_QCOW2_OFF_REFCOUNT_CLUSTERS, v);
+}
+
+static inline void lbd_qcow2_hdr_set_snapshot_table(void *h, _qcow2_u64 v)
+{
+	_qcow2_put64(h, LBD_QCOW2_OFF_SNAPSHOT_TABLE, v);
+}
+
+static inline void lbd_qcow2_hdr_set_snapshot_count(void *h, _qcow2_u32 v)
+{
+	_qcow2_put32(h, LBD_QCOW2_OFF_SNAPSHOT_COUNT, v);
 }
 
 #endif /* _LBD_QCOW2_FORMAT_H */

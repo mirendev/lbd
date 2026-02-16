@@ -48,11 +48,15 @@ static int lbd_open(struct gendisk *disk, unsigned int mode)
 
 	if (dev->state != LBD_STATE_BOUND)
 		return -ENXIO;
+	atomic_inc(&dev->open_count);
 	return 0;
 }
 
 static void lbd_release(struct gendisk *disk)
 {
+	struct lbd_device *dev = disk->private_data;
+
+	atomic_dec(&dev->open_count);
 }
 
 static const struct block_device_operations lbd_fops = {
@@ -1023,11 +1027,157 @@ static int lbd_remove_device(struct lbd_ctl_remove __user *uarg)
 		mutex_unlock(&lbd_devices_mutex);
 		return -EBUSY;
 	}
+	if (atomic_read(&dev->open_count) > 0) {
+		mutex_unlock(&lbd_devices_mutex);
+		return -EBUSY;
+	}
 	idr_remove(&lbd_devices, arg.index);
 	mutex_unlock(&lbd_devices_mutex);
 
 	pr_info("lbd%d: detaching\n", dev->index);
 	lbd_destroy_device(dev);
+	return 0;
+}
+
+static int lbd_snapshot_create(struct lbd_ctl_snapshot __user *uarg)
+{
+	struct lbd_ctl_snapshot arg;
+	struct lbd_device *dev;
+	u8 tmp[128];
+	struct cbor_enc e;
+	u64 ts;
+	int ret;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+
+	arg.name[sizeof(arg.name) - 1] = '\0';
+	if (arg.name[0] == '\0')
+		return -EINVAL;
+
+	mutex_lock(&lbd_devices_mutex);
+	dev = idr_find(&lbd_devices, arg.index);
+	if (!dev || dev->state != LBD_STATE_BOUND || !dev->is_qcow2) {
+		mutex_unlock(&lbd_devices_mutex);
+		return dev ? -EINVAL : -ENODEV;
+	}
+	mutex_unlock(&lbd_devices_mutex);
+
+	/* Rotate log segment before snapshot */
+	mutex_lock(&dev->log_mutex);
+	if (dev->log_has_entries)
+		lbd_rotate_segment(dev);
+	mutex_unlock(&dev->log_mutex);
+
+	/* Create the snapshot */
+	ret = lbd_qcow2_snapshot_create(dev, arg.name);
+	if (ret)
+		return ret;
+
+	/* Write snapshot marker to log */
+	ts = ktime_get_real_ns();
+	mutex_lock(&dev->log_mutex);
+
+	cbor_enc_init(&e, tmp, sizeof(tmp));
+	cbor_enc_map(&e, 4);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_OP);
+	cbor_enc_text(&e, "S", 1);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_TIMESTAMP);
+	cbor_enc_uint(&e, ts);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_SEQUENCE);
+	cbor_enc_uint(&e, dev->log_seq++);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_SNAP_NAME);
+	cbor_enc_text(&e, arg.name, strlen(arg.name));
+
+	if (!e.err)
+		lbd_log_buf_append(dev, tmp, cbor_enc_len(&e));
+
+	dev->log_has_entries = true;
+	mutex_unlock(&dev->log_mutex);
+
+	return 0;
+}
+
+static int lbd_snapshot_delete(struct lbd_ctl_snapshot __user *uarg)
+{
+	struct lbd_ctl_snapshot arg;
+	struct lbd_device *dev;
+	u8 tmp[64];
+	struct cbor_enc e;
+	u64 ts;
+	int ret;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+
+	mutex_lock(&lbd_devices_mutex);
+	dev = idr_find(&lbd_devices, arg.index);
+	if (!dev || dev->state != LBD_STATE_BOUND || !dev->is_qcow2) {
+		mutex_unlock(&lbd_devices_mutex);
+		return dev ? -EINVAL : -ENODEV;
+	}
+	mutex_unlock(&lbd_devices_mutex);
+
+	ret = lbd_qcow2_snapshot_delete(dev, arg.snapshot_id);
+	if (ret)
+		return ret;
+
+	/* Write delete marker to log */
+	ts = ktime_get_real_ns();
+	mutex_lock(&dev->log_mutex);
+
+	cbor_enc_init(&e, tmp, sizeof(tmp));
+	cbor_enc_map(&e, 4);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_OP);
+	cbor_enc_text(&e, "X", 1);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_TIMESTAMP);
+	cbor_enc_uint(&e, ts);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_SEQUENCE);
+	cbor_enc_uint(&e, dev->log_seq++);
+
+	cbor_enc_uint(&e, LBD_CBOR_KEY_SNAP_NAME);
+	cbor_enc_uint(&e, arg.snapshot_id);
+
+	if (!e.err)
+		lbd_log_buf_append(dev, tmp, cbor_enc_len(&e));
+
+	dev->log_has_entries = true;
+	mutex_unlock(&dev->log_mutex);
+
+	return 0;
+}
+
+static int lbd_snapshot_list(struct lbd_ctl_snapshot_list __user *uarg)
+{
+	struct lbd_ctl_snapshot_list arg;
+	struct lbd_device *dev;
+	int ret;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+
+	mutex_lock(&lbd_devices_mutex);
+	dev = idr_find(&lbd_devices, arg.index);
+	if (!dev || dev->state != LBD_STATE_BOUND || !dev->is_qcow2) {
+		mutex_unlock(&lbd_devices_mutex);
+		return dev ? -EINVAL : -ENODEV;
+	}
+	mutex_unlock(&lbd_devices_mutex);
+
+	ret = lbd_qcow2_snapshot_list(dev, (void __user *)(unsigned long)arg.buf,
+				      arg.buf_size, &arg.count);
+	if (ret)
+		return ret;
+
+	if (copy_to_user(uarg, &arg, sizeof(arg)))
+		return -EFAULT;
 	return 0;
 }
 
@@ -1247,6 +1397,17 @@ static ssize_t log_buf_used_show(struct device *d,
 }
 static DEVICE_ATTR_RO(log_buf_used);
 
+static ssize_t snapshot_count_show(struct device *d,
+				   struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	if (!dev->is_qcow2)
+		return sysfs_emit(buf, "0\n");
+	return sysfs_emit(buf, "%u\n", dev->qcow2.snapshot_count);
+}
+static DEVICE_ATTR_RO(snapshot_count);
+
 static ssize_t segment_age_secs_show(struct device *d,
 				     struct device_attribute *attr, char *buf)
 {
@@ -1279,6 +1440,7 @@ static struct attribute *lbd_attrs[] = {
 	&dev_attr_log_rotations.attr,
 	&dev_attr_log_buf_used.attr,
 	&dev_attr_segment_age_secs.attr,
+	&dev_attr_snapshot_count.attr,
 	NULL,
 };
 
@@ -1301,6 +1463,15 @@ static long lbd_ctl_ioctl(struct file *file, unsigned int cmd,
 		return lbd_remove_device((struct lbd_ctl_remove __user *)arg);
 	case LBD_CTL_INFO:
 		return lbd_info_device((struct lbd_ctl_info __user *)arg);
+	case LBD_CTL_SNAPSHOT_CREATE:
+		return lbd_snapshot_create(
+			(struct lbd_ctl_snapshot __user *)arg);
+	case LBD_CTL_SNAPSHOT_DELETE:
+		return lbd_snapshot_delete(
+			(struct lbd_ctl_snapshot __user *)arg);
+	case LBD_CTL_SNAPSHOT_LIST:
+		return lbd_snapshot_list(
+			(struct lbd_ctl_snapshot_list __user *)arg);
 	default:
 		return -ENOTTY;
 	}

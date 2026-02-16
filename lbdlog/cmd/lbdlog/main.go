@@ -146,8 +146,28 @@ func printLog(path string) error {
 			label = "WRITE"
 		} else if e.IsTrim() {
 			label = "TRIM"
+		} else if e.IsSnapshotCreate() {
+			label = "SNAPSHOT CREATE"
+		} else if e.IsSnapshotDelete() {
+			label = "SNAPSHOT DELETE"
 		} else {
 			label = "UNKNOWN(" + e.Op + ")"
+		}
+
+		fmt.Printf("--- Entry #%d [%s] ---\n", e.Sequence, label)
+		fmt.Printf("  Time:     %s UTC\n", ts.Format("2006-01-02 15:04:05.000000000"))
+
+		if e.IsSnapshotCreate() {
+			fmt.Printf("  Name:     %q\n", e.SnapshotCreateName())
+			fmt.Println()
+			count++
+			continue
+		}
+		if e.IsSnapshotDelete() {
+			fmt.Printf("  ID:       %d\n", e.SnapshotDeleteID())
+			fmt.Println()
+			count++
+			continue
 		}
 
 		blocks := uint64(e.Length) / uint64(h.BlockSize)
@@ -155,8 +175,6 @@ func printLog(path string) error {
 		offsetStart := e.Block * uint64(h.BlockSize)
 		offsetEnd := offsetStart + uint64(e.Length) - 1
 
-		fmt.Printf("--- Entry #%d [%s] ---\n", e.Sequence, label)
-		fmt.Printf("  Time:     %s UTC\n", ts.Format("2006-01-02 15:04:05.000000000"))
 		fmt.Printf("  Extent:   %d-%d (%d blocks)\n", e.Block, blockEnd, blocks)
 		fmt.Printf("  Offset:   0x%x-0x%x\n", offsetStart, offsetEnd)
 		fmt.Printf("  Length:   %s (%d bytes)\n", fmtSize(uint64(e.Length)), e.Length)
@@ -304,6 +322,12 @@ func replayToFlat(logFiles []string, outputPath string, deviceSize uint64, block
 			}
 
 			totalEntries++
+
+			if e.IsSnapshotCreate() || e.IsSnapshotDelete() {
+				// Flat files don't support snapshots — skip
+				continue
+			}
+
 			offset := int64(e.Block) * int64(blockSize)
 
 			if e.IsWrite() {
@@ -352,7 +376,7 @@ func replayToQCow2(logFiles []string, outputPath string, deviceSize uint64, bloc
 		return fmt.Errorf("creating qcow2 image: %w", err)
 	}
 
-	var totalEntries, totalWrites, totalTrims, crcErrors int
+	var totalEntries, totalWrites, totalTrims, totalSnaps, crcErrors int
 	var totalBytes uint64
 
 	for _, logPath := range logFiles {
@@ -383,7 +407,25 @@ func replayToQCow2(logFiles []string, outputPath string, deviceSize uint64, bloc
 			totalEntries++
 			offset := int64(e.Block) * int64(blockSize)
 
-			if e.IsWrite() {
+			if e.IsSnapshotCreate() {
+				name := e.SnapshotCreateName()
+				if err := img.SnapshotCreate(name); err != nil {
+					f.Close()
+					img.Close()
+					return fmt.Errorf("creating snapshot %q: %w", name, err)
+				}
+				totalSnaps++
+				fmt.Printf("  snapshot create: %q\n", name)
+			} else if e.IsSnapshotDelete() {
+				id := e.SnapshotDeleteID()
+				if err := img.SnapshotDelete(id); err != nil {
+					f.Close()
+					img.Close()
+					return fmt.Errorf("deleting snapshot %d: %w", id, err)
+				}
+				totalSnaps++
+				fmt.Printf("  snapshot delete: %d\n", id)
+			} else if e.IsWrite() {
 				if !e.ValidateCRC() {
 					crcErrors++
 					fmt.Fprintf(os.Stderr, "Warning: CRC mismatch at entry seq=%d in %s\n", e.Sequence, logPath)
@@ -413,8 +455,8 @@ func replayToQCow2(logFiles []string, outputPath string, deviceSize uint64, bloc
 		return fmt.Errorf("closing qcow2 image: %w", err)
 	}
 
-	fmt.Printf("Replayed %d entries (%d writes, %d trims) from %d segments\n",
-		totalEntries, totalWrites, totalTrims, len(logFiles))
+	fmt.Printf("Replayed %d entries (%d writes, %d trims, %d snapshots) from %d segments\n",
+		totalEntries, totalWrites, totalTrims, totalSnaps, len(logFiles))
 	fmt.Printf("Output: %s (qcow2-lz4, virtual %s)\n", outputPath, fmtSize(deviceSize))
 	fmt.Printf("CRC errors: %d\n", crcErrors)
 
@@ -996,6 +1038,7 @@ type entryMeta struct {
 	block      uint64
 	numBlocks  uint64
 	isWrite    bool
+	isSnapshot bool
 	dataLen    uint32
 	liveRanges []interval
 }
@@ -1079,6 +1122,7 @@ func runGC(cfg *gcArgs) error {
 				block:      e.Block,
 				numBlocks:  numBlocks,
 				isWrite:    e.IsWrite(),
+				isSnapshot: e.IsSnapshotCreate() || e.IsSnapshotDelete(),
 				dataLen:    e.Length,
 			}
 			allMeta = append(allMeta, m)
@@ -1099,6 +1143,11 @@ func runGC(cfg *gcArgs) error {
 	blockSize := firstHeader.BlockSize
 	for i := len(allMeta) - 1; i >= 0; i-- {
 		m := &allMeta[i]
+		if m.isSnapshot {
+			// Snapshot markers are always live — they must be preserved
+			m.liveRanges = []interval{{0, 1}}
+			continue
+		}
 		lo := m.block
 		hi := lo + m.numBlocks
 		liveRanges := covered.uncovered(lo, hi)
@@ -1244,34 +1293,53 @@ func runGC(cfg *gcArgs) error {
 				return fmt.Errorf("reading entry from %s: %w", stats[ri].path, err)
 			}
 
-			if ranges, ok := liveSet[entryKey{ri, ei}]; ok {
-				for _, r := range ranges {
-					splitEntry := &lbdlog.Entry{
+			if _, ok := liveSet[entryKey{ri, ei}]; ok {
+				if e.IsSnapshotCreate() || e.IsSnapshotDelete() {
+					// Copy snapshot markers verbatim
+					copyEntry := &lbdlog.Entry{
 						Op:          e.Op,
-						TimestampNS: uint64(time.Now().UnixNano()),
+						TimestampNS: e.TimestampNS,
 						Sequence:    seq,
-						Block:       r.lo,
+						SnapName:    e.SnapName,
 					}
 					seq++
-					if e.IsWrite() {
-						dataStart := (r.lo - e.Block) * uint64(blockSize)
-						dataEnd := (r.hi - e.Block) * uint64(blockSize)
-						slice := e.Data[dataStart:dataEnd]
-						splitEntry.Length = uint32(len(slice))
-						splitEntry.Checksum = crc32.ChecksumIEEE(slice)
-						splitEntry.Data = slice
-					} else {
-						splitEntry.Length = uint32((r.hi - r.lo) * uint64(blockSize))
-					}
-					if err := wr.WriteEntry(splitEntry); err != nil {
+					if err := wr.WriteEntry(copyEntry); err != nil {
 						f.Close()
 						outFile.Close()
 						os.Remove(tmpPath)
 						return fmt.Errorf("writing entry: %w", err)
 					}
 					copiedEntries++
-					if e.IsWrite() {
-						copiedBytes += uint64(splitEntry.Length)
+				} else {
+					ranges := liveSet[entryKey{ri, ei}]
+					for _, r := range ranges {
+						splitEntry := &lbdlog.Entry{
+							Op:          e.Op,
+							TimestampNS: uint64(time.Now().UnixNano()),
+							Sequence:    seq,
+							Block:       r.lo,
+						}
+						seq++
+						if e.IsWrite() {
+							dataStart := (r.lo - e.Block) * uint64(blockSize)
+							dataEnd := (r.hi - e.Block) * uint64(blockSize)
+							slice := e.Data[dataStart:dataEnd]
+							splitEntry.Length = uint32(len(slice))
+							splitEntry.Checksum = crc32.ChecksumIEEE(slice)
+							splitEntry.Data = slice
+						} else {
+							splitEntry.Length = uint32((r.hi - r.lo) * uint64(blockSize))
+						}
+						if err := wr.WriteEntry(splitEntry); err != nil {
+							f.Close()
+							outFile.Close()
+							os.Remove(tmpPath)
+							return fmt.Errorf("writing entry: %w", err)
+						}
+						copiedEntries++
+						if e.IsWrite() {
+							copiedBytes += uint64(splitEntry.Length)
+						}
 					}
 				}
 			}
