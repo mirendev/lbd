@@ -87,6 +87,18 @@ struct lbd_ctl_info {
 #define LBD_CBOR_KEY_CHECKSUM		6
 #define LBD_CBOR_KEY_DATA		7
 
+/* Watch command keys (write path: userspace -> kernel) */
+#define LBD_WATCH_KEY_CMD		1
+#define LBD_WATCH_KEY_DEV		2
+
+/* Event keys (read path: kernel -> userspace) */
+#define LBD_EVENT_KEY_TYPE		1
+#define LBD_EVENT_KEY_DEV		2
+#define LBD_EVENT_KEY_LABEL		3
+#define LBD_EVENT_KEY_DIR		4
+#define LBD_EVENT_KEY_SEQ		5
+#define LBD_EVENT_KEY_SIZE		6
+
 /* Per-request data (embedded in blk-mq PDU) */
 struct lbd_cmd {
 	struct list_head list_entry;

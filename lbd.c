@@ -26,7 +26,9 @@
 #include "lbd.h"
 #include "lbd_qcow2.h"
 #include "cbor_enc.h"
+#include "cbor_dec.h"
 #include "lz4_kcompat.h"
+#include <linux/poll.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("lbd authors");
@@ -37,6 +39,32 @@ static int lbd_major;
 static DEFINE_IDR(lbd_devices);
 static DEFINE_MUTEX(lbd_devices_mutex);
 static struct miscdevice lbd_misc;
+
+/* ----------------------------------------------------------------
+ * Log rotation watchers
+ * ---------------------------------------------------------------- */
+
+#define LBD_WATCHER_QUEUE_SIZE 64
+
+struct lbd_watcher_event {
+	int   dev_index;
+	u64   log_seq;
+	u64   device_size;
+	char  segment_label[25];
+	char  log_dir[LBD_LOG_PATH_MAX];
+};
+
+struct lbd_watcher {
+	struct list_head        list;
+	spinlock_t              lock;
+	wait_queue_head_t       wq;
+	struct lbd_watcher_event queue[LBD_WATCHER_QUEUE_SIZE];
+	unsigned int            head, tail, count;
+	int                     filter_dev; /* -1 = all */
+};
+
+static LIST_HEAD(lbd_watchers);
+static DEFINE_SPINLOCK(lbd_watchers_lock);
 
 /* ----------------------------------------------------------------
  * Block device operations
@@ -105,6 +133,7 @@ static const struct attribute_group lbd_attr_group;
 static int lbd_open_log_file(struct lbd_device *dev);
 static void lbd_rotate_segment(struct lbd_device *dev);
 static void lbd_maybe_rotate_segment(struct lbd_device *dev);
+static void lbd_notify_watchers(struct lbd_device *dev);
 
 /* ----------------------------------------------------------------
  * I/O: log write buffer
@@ -669,6 +698,9 @@ static void lbd_rotate_segment(struct lbd_device *dev)
 next:
 	atomic64_inc(&dev->stat_log_rotations);
 
+	/* Notify watchers before lbd_begin_segment() overwrites the label */
+	lbd_notify_watchers(dev);
+
 	/* Begin fresh segment (buffer only, no file yet) */
 	lbd_begin_segment(dev);
 
@@ -714,6 +746,7 @@ static void lbd_finalize_log(struct lbd_device *dev)
 		lbd_log_name_final(dev->log_segment_label, final_name,
 				   sizeof(final_name));
 		lbd_rename_file(dev->log_file, final_name);
+		lbd_notify_watchers(dev);
 	}
 
 	fput(dev->log_file);
@@ -1296,6 +1329,262 @@ static const struct attribute_group lbd_attr_group = {
 };
 
 /* ----------------------------------------------------------------
+ * Watcher helpers
+ * ---------------------------------------------------------------- */
+
+static struct lbd_watcher *lbd_watcher_alloc(int filter_dev)
+{
+	struct lbd_watcher *w;
+
+	w = kzalloc(sizeof(*w), GFP_KERNEL);
+	if (!w)
+		return NULL;
+
+	spin_lock_init(&w->lock);
+	init_waitqueue_head(&w->wq);
+	w->filter_dev = filter_dev;
+	w->head = 0;
+	w->tail = 0;
+	w->count = 0;
+	return w;
+}
+
+static void lbd_watcher_enqueue(struct lbd_watcher *w,
+				const struct lbd_watcher_event *ev)
+{
+	spin_lock(&w->lock);
+	if (w->count == LBD_WATCHER_QUEUE_SIZE) {
+		/* Overflow: drop oldest */
+		w->head = (w->head + 1) % LBD_WATCHER_QUEUE_SIZE;
+		w->count--;
+	}
+	w->queue[w->tail] = *ev;
+	w->tail = (w->tail + 1) % LBD_WATCHER_QUEUE_SIZE;
+	w->count++;
+	spin_unlock(&w->lock);
+	wake_up_interruptible(&w->wq);
+}
+
+/* Copy front event without removing (for encode-then-dequeue pattern) */
+static bool lbd_watcher_peek(struct lbd_watcher *w,
+			     struct lbd_watcher_event *ev)
+{
+	bool got;
+
+	spin_lock(&w->lock);
+	got = w->count > 0;
+	if (got)
+		*ev = w->queue[w->head];
+	spin_unlock(&w->lock);
+	return got;
+}
+
+/* Remove front event after successful copy_to_user */
+static void lbd_watcher_pop(struct lbd_watcher *w)
+{
+	spin_lock(&w->lock);
+	if (w->count > 0) {
+		w->head = (w->head + 1) % LBD_WATCHER_QUEUE_SIZE;
+		w->count--;
+	}
+	spin_unlock(&w->lock);
+}
+
+/*
+ * Notify all watchers of a log rotation event.
+ * Called with dev->log_mutex held (sleepable).
+ * Acquires lbd_watchers_lock (spin), then w->lock (spin).
+ */
+static void lbd_notify_watchers(struct lbd_device *dev)
+{
+	struct lbd_watcher_event ev;
+	struct lbd_watcher *w;
+
+	ev.dev_index = dev->index;
+	ev.log_seq = dev->log_seq;
+	ev.device_size = dev->size;
+	memcpy(ev.segment_label, dev->log_segment_label,
+	       sizeof(ev.segment_label));
+	strscpy(ev.log_dir, dev->log_dir, sizeof(ev.log_dir));
+
+	spin_lock(&lbd_watchers_lock);
+	list_for_each_entry(w, &lbd_watchers, list) {
+		if (w->filter_dev >= 0 && w->filter_dev != dev->index)
+			continue;
+		lbd_watcher_enqueue(w, &ev);
+	}
+	spin_unlock(&lbd_watchers_lock);
+}
+
+/* ----------------------------------------------------------------
+ * Control device: watcher fops
+ * ---------------------------------------------------------------- */
+
+static int lbd_ctl_open(struct inode *inode, struct file *file)
+{
+	file->private_data = NULL;
+	return 0;
+}
+
+static int lbd_ctl_release(struct inode *inode, struct file *file)
+{
+	struct lbd_watcher *w = file->private_data;
+
+	if (w) {
+		spin_lock(&lbd_watchers_lock);
+		list_del(&w->list);
+		spin_unlock(&lbd_watchers_lock);
+		kfree(w);
+		file->private_data = NULL;
+	}
+	return 0;
+}
+
+static ssize_t lbd_ctl_write(struct file *file, const char __user *ubuf,
+			     size_t count, loff_t *ppos)
+{
+	u8 kbuf[64];
+	struct cbor_dec d;
+	u64 map_count, key;
+	char cmd[16];
+	int filter_dev = -1;
+	bool have_cmd = false;
+	struct lbd_watcher *w;
+	u64 i;
+
+	if (file->private_data)
+		return -EBUSY;
+
+	if (count > sizeof(kbuf))
+		return -EINVAL;
+
+	if (copy_from_user(kbuf, ubuf, count))
+		return -EFAULT;
+
+	cbor_dec_init(&d, kbuf, count);
+
+	if (cbor_dec_map(&d, &map_count))
+		return -EINVAL;
+
+	for (i = 0; i < map_count; i++) {
+		if (cbor_dec_uint(&d, &key))
+			return -EINVAL;
+
+		switch (key) {
+		case LBD_WATCH_KEY_CMD:
+			if (cbor_dec_text(&d, cmd, sizeof(cmd), NULL))
+				return -EINVAL;
+			have_cmd = true;
+			break;
+		case LBD_WATCH_KEY_DEV: {
+			u64 dev_val;
+			if (cbor_dec_uint(&d, &dev_val))
+				return -EINVAL;
+			filter_dev = (int)dev_val;
+			break;
+		}
+		default:
+			return -EINVAL;
+		}
+	}
+
+	if (!have_cmd || strcmp(cmd, "watch") != 0)
+		return -EINVAL;
+
+	w = lbd_watcher_alloc(filter_dev);
+	if (!w)
+		return -ENOMEM;
+
+	spin_lock(&lbd_watchers_lock);
+	list_add_tail(&w->list, &lbd_watchers);
+	spin_unlock(&lbd_watchers_lock);
+
+	file->private_data = w;
+	return count;
+}
+
+static ssize_t lbd_ctl_read(struct file *file, char __user *ubuf,
+			    size_t count, loff_t *ppos)
+{
+	struct lbd_watcher *w = file->private_data;
+	struct lbd_watcher_event ev;
+	u8 tmp[512];
+	struct cbor_enc e;
+	size_t encoded_len;
+	size_t label_len, dir_len;
+
+	if (!w)
+		return -EINVAL;
+
+	/* Block until an event is available (or EAGAIN for nonblock) */
+	if (!lbd_watcher_peek(w, &ev)) {
+		if (file->f_flags & O_NONBLOCK)
+			return -EAGAIN;
+
+		if (wait_event_interruptible(w->wq,
+					     lbd_watcher_peek(w, &ev)))
+			return -ERESTARTSYS;
+	}
+
+	/* Encode event to CBOR */
+	cbor_enc_init(&e, tmp, sizeof(tmp));
+	cbor_enc_map(&e, 6);
+
+	cbor_enc_uint(&e, LBD_EVENT_KEY_TYPE);
+	cbor_enc_text(&e, "log_rotated", 11);
+
+	cbor_enc_uint(&e, LBD_EVENT_KEY_DEV);
+	cbor_enc_uint(&e, (u64)ev.dev_index);
+
+	cbor_enc_uint(&e, LBD_EVENT_KEY_LABEL);
+	label_len = strlen(ev.segment_label);
+	cbor_enc_text(&e, ev.segment_label, label_len);
+
+	cbor_enc_uint(&e, LBD_EVENT_KEY_DIR);
+	dir_len = strlen(ev.log_dir);
+	cbor_enc_text(&e, ev.log_dir, dir_len);
+
+	cbor_enc_uint(&e, LBD_EVENT_KEY_SEQ);
+	cbor_enc_uint(&e, ev.log_seq);
+
+	cbor_enc_uint(&e, LBD_EVENT_KEY_SIZE);
+	cbor_enc_uint(&e, ev.device_size);
+
+	if (e.err)
+		return -EINVAL;
+
+	encoded_len = cbor_enc_len(&e);
+	if (count < encoded_len)
+		return -EINVAL;
+
+	if (copy_to_user(ubuf, tmp, encoded_len))
+		return -EFAULT;
+
+	/* Only dequeue after successful copy_to_user */
+	lbd_watcher_pop(w);
+	return encoded_len;
+}
+
+static __poll_t lbd_ctl_poll(struct file *file,
+			     struct poll_table_struct *wait)
+{
+	struct lbd_watcher *w = file->private_data;
+	__poll_t mask = 0;
+
+	if (!w)
+		return 0;
+
+	poll_wait(file, &w->wq, wait);
+
+	spin_lock(&w->lock);
+	if (w->count > 0)
+		mask |= EPOLLIN | EPOLLRDNORM;
+	spin_unlock(&w->lock);
+
+	return mask;
+}
+
+/* ----------------------------------------------------------------
  * Control device (misc device)
  * ---------------------------------------------------------------- */
 
@@ -1316,6 +1605,11 @@ static long lbd_ctl_ioctl(struct file *file, unsigned int cmd,
 
 static const struct file_operations lbd_ctl_fops = {
 	.owner		= THIS_MODULE,
+	.open		= lbd_ctl_open,
+	.release	= lbd_ctl_release,
+	.read		= lbd_ctl_read,
+	.write		= lbd_ctl_write,
+	.poll		= lbd_ctl_poll,
 	.unlocked_ioctl	= lbd_ctl_ioctl,
 	.compat_ioctl	= compat_ptr_ioctl,
 };

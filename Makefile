@@ -12,7 +12,7 @@ KDIR ?= /lib/modules/$(shell uname -r)/build
 
 all: lbd_mod.ko lbdctl
 
-lbd_mod.ko: lbd.c lbd.h lbd_qcow2.c lbd_qcow2.h lbd_qcow2_format.h cbor_enc.h lz4_kcompat.h lz4/lz4.c lz4/lz4.h
+lbd_mod.ko: lbd.c lbd.h lbd_qcow2.c lbd_qcow2.h lbd_qcow2_format.h cbor_enc.h cbor_dec.h lz4_kcompat.h lz4/lz4.c lz4/lz4.h
 	$(MAKE) -C $(KDIR) M=$(PWD) KBUILD_MODPOST_WARN=1 modules
 
 lbdctl: lbdctl.c lbd.h lbd_qcow2_format.h lz4/lz4.c lz4/lz4.h

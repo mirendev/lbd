@@ -13,6 +13,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +43,18 @@
 #define LBD_CBOR_KEY_LENGTH		5
 #define LBD_CBOR_KEY_CHECKSUM		6
 #define LBD_CBOR_KEY_DATA		7
+
+/* Watch command keys (write path) */
+#define LBD_WATCH_KEY_CMD		1
+#define LBD_WATCH_KEY_DEV		2
+
+/* Event keys (read path) */
+#define LBD_EVENT_KEY_TYPE		1
+#define LBD_EVENT_KEY_DEV		2
+#define LBD_EVENT_KEY_LABEL		3
+#define LBD_EVENT_KEY_DIR		4
+#define LBD_EVENT_KEY_SEQ		5
+#define LBD_EVENT_KEY_SIZE		6
 
 #define LBD_CTL_MAGIC		'L'
 
@@ -1888,6 +1902,341 @@ compact_err:
 }
 
 /* ----------------------------------------------------------------
+ * Watch command (log rotation notifications)
+ * ---------------------------------------------------------------- */
+
+static volatile sig_atomic_t watch_running = 1;
+
+static void watch_sigint(int sig)
+{
+	(void)sig;
+	watch_running = 0;
+}
+
+/*
+ * Minimal CBOR encoder for userspace (write path).
+ * Encodes a CBOR head: major type (top 3 bits) + value.
+ */
+static size_t cbor_write_head(uint8_t *buf, uint8_t major, uint64_t val)
+{
+	uint8_t mt = major << 5;
+
+	if (val < 24) {
+		buf[0] = mt | (uint8_t)val;
+		return 1;
+	} else if (val <= 0xFF) {
+		buf[0] = mt | 24;
+		buf[1] = (uint8_t)val;
+		return 2;
+	} else if (val <= 0xFFFF) {
+		buf[0] = mt | 25;
+		buf[1] = (uint8_t)(val >> 8);
+		buf[2] = (uint8_t)val;
+		return 3;
+	} else if (val <= 0xFFFFFFFF) {
+		buf[0] = mt | 26;
+		buf[1] = (uint8_t)(val >> 24);
+		buf[2] = (uint8_t)(val >> 16);
+		buf[3] = (uint8_t)(val >> 8);
+		buf[4] = (uint8_t)val;
+		return 5;
+	} else {
+		buf[0] = mt | 27;
+		buf[1] = (uint8_t)(val >> 56);
+		buf[2] = (uint8_t)(val >> 48);
+		buf[3] = (uint8_t)(val >> 40);
+		buf[4] = (uint8_t)(val >> 32);
+		buf[5] = (uint8_t)(val >> 24);
+		buf[6] = (uint8_t)(val >> 16);
+		buf[7] = (uint8_t)(val >> 8);
+		buf[8] = (uint8_t)val;
+		return 9;
+	}
+}
+
+/*
+ * Encode and write a watch command to the control device fd.
+ * dev_index < 0 means watch all devices.
+ */
+static int cbor_write_watch_cmd(int fd, int dev_index)
+{
+	uint8_t buf[64];
+	size_t pos = 0;
+	const char *cmd_str = "watch";
+	size_t cmd_len = 5;
+	int map_items = (dev_index >= 0) ? 2 : 1;
+	ssize_t n;
+
+	/* map(1 or 2) */
+	pos += cbor_write_head(buf + pos, 5, map_items);
+
+	/* key 1: "watch" */
+	pos += cbor_write_head(buf + pos, 0, LBD_WATCH_KEY_CMD);
+	pos += cbor_write_head(buf + pos, 3, cmd_len);
+	memcpy(buf + pos, cmd_str, cmd_len);
+	pos += cmd_len;
+
+	/* key 2: dev_index (optional) */
+	if (dev_index >= 0) {
+		pos += cbor_write_head(buf + pos, 0, LBD_WATCH_KEY_DEV);
+		pos += cbor_write_head(buf + pos, 0, (uint64_t)dev_index);
+	}
+
+	n = write(fd, buf, pos);
+	if (n < 0) {
+		fprintf(stderr, "Failed to write watch command: %s\n",
+			strerror(errno));
+		return -1;
+	}
+	if ((size_t)n != pos) {
+		fprintf(stderr, "Short write on watch command\n");
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Decode a CBOR-encoded event message from a buffer.
+ * Uses the existing fd-based cbor_read_* functions via a temporary
+ * approach: we decode inline from the buffer.
+ */
+static int decode_watch_event(const uint8_t *buf, size_t len,
+			      int *dev_index, char *label, size_t label_cap,
+			      char *dir, size_t dir_cap,
+			      uint64_t *log_seq, uint64_t *device_size)
+{
+	size_t pos = 0;
+	uint8_t ib, major, ai;
+	uint64_t map_count, key, val;
+	uint64_t slen;
+
+	/* Inline buffer-based CBOR decoder (mirrors cbor_dec.h logic) */
+#define BUF_HEAD(major_out, val_out) do {			\
+	if (pos >= len) return -1;				\
+	ib = buf[pos++];					\
+	*(major_out) = ib >> 5;					\
+	ai = ib & 0x1F;					\
+	if (ai < 24) { *(val_out) = ai; }			\
+	else if (ai == 24) {					\
+		if (pos + 1 > len) return -1;			\
+		*(val_out) = buf[pos++];			\
+	} else if (ai == 25) {					\
+		if (pos + 2 > len) return -1;			\
+		*(val_out) = ((uint64_t)buf[pos] << 8) | buf[pos+1]; \
+		pos += 2;					\
+	} else if (ai == 26) {					\
+		if (pos + 4 > len) return -1;			\
+		*(val_out) = ((uint64_t)buf[pos] << 24) |	\
+			     ((uint64_t)buf[pos+1] << 16) |	\
+			     ((uint64_t)buf[pos+2] << 8) |	\
+			     buf[pos+3];			\
+		pos += 4;					\
+	} else if (ai == 27) {					\
+		if (pos + 8 > len) return -1;			\
+		*(val_out) = ((uint64_t)buf[pos] << 56) |	\
+			     ((uint64_t)buf[pos+1] << 48) |	\
+			     ((uint64_t)buf[pos+2] << 40) |	\
+			     ((uint64_t)buf[pos+3] << 32) |	\
+			     ((uint64_t)buf[pos+4] << 24) |	\
+			     ((uint64_t)buf[pos+5] << 16) |	\
+			     ((uint64_t)buf[pos+6] << 8) |	\
+			     buf[pos+7];			\
+		pos += 8;					\
+	} else { return -1; }					\
+} while (0)
+
+	/* Read map header */
+	BUF_HEAD(&major, &map_count);
+	if (major != 5)
+		return -1;
+
+	*dev_index = -1;
+	*log_seq = 0;
+	*device_size = 0;
+	label[0] = '\0';
+	dir[0] = '\0';
+
+	for (uint64_t i = 0; i < map_count; i++) {
+		/* Read key (uint) */
+		BUF_HEAD(&major, &key);
+		if (major != 0)
+			return -1;
+
+		switch (key) {
+		case LBD_EVENT_KEY_TYPE:
+			/* text string — skip it */
+			BUF_HEAD(&major, &slen);
+			if (major != 3 || pos + slen > len)
+				return -1;
+			pos += slen;
+			break;
+		case LBD_EVENT_KEY_DEV:
+			BUF_HEAD(&major, &val);
+			if (major != 0)
+				return -1;
+			*dev_index = (int)val;
+			break;
+		case LBD_EVENT_KEY_LABEL:
+			BUF_HEAD(&major, &slen);
+			if (major != 3 || slen >= label_cap || pos + slen > len)
+				return -1;
+			memcpy(label, buf + pos, slen);
+			label[slen] = '\0';
+			pos += slen;
+			break;
+		case LBD_EVENT_KEY_DIR:
+			BUF_HEAD(&major, &slen);
+			if (major != 3 || slen >= dir_cap || pos + slen > len)
+				return -1;
+			memcpy(dir, buf + pos, slen);
+			dir[slen] = '\0';
+			pos += slen;
+			break;
+		case LBD_EVENT_KEY_SEQ:
+			BUF_HEAD(&major, &val);
+			if (major != 0)
+				return -1;
+			*log_seq = val;
+			break;
+		case LBD_EVENT_KEY_SIZE:
+			BUF_HEAD(&major, &val);
+			if (major != 0)
+				return -1;
+			*device_size = val;
+			break;
+		default:
+			return -1;
+		}
+	}
+
+#undef BUF_HEAD
+	return 0;
+}
+
+static int cmd_watch(int argc, char **argv)
+{
+	int fd;
+	int dev_filter = -1;
+	int json = 0;
+	struct pollfd pfd;
+	struct sigaction sa;
+	uint8_t rbuf[512];
+
+	for (int i = 0; i < argc; i++) {
+		if (strcmp(argv[i], "--dev") == 0) {
+			if (++i >= argc) {
+				fprintf(stderr, "--dev requires a value\n");
+				return 1;
+			}
+			dev_filter = atoi(argv[i]);
+		} else if (strcmp(argv[i], "--json") == 0) {
+			json = 1;
+		} else {
+			fprintf(stderr, "Unexpected argument: %s\n", argv[i]);
+			return 1;
+		}
+	}
+
+	fd = open(LBD_CTL_PATH, O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "Cannot open %s: %s\n",
+			LBD_CTL_PATH, strerror(errno));
+		if (errno == ENOENT)
+			fprintf(stderr, "Is the lbd module loaded?\n");
+		return 1;
+	}
+
+	/* Send watch command */
+	if (cbor_write_watch_cmd(fd, dev_filter) < 0) {
+		close(fd);
+		return 1;
+	}
+
+	if (!json) {
+		if (dev_filter >= 0)
+			fprintf(stderr, "Watching lbd%d for log rotations...\n",
+				dev_filter);
+		else
+			fprintf(stderr, "Watching all devices for log rotations...\n");
+	}
+
+	/* Setup SIGINT handler for clean exit */
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = watch_sigint;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+
+	pfd.fd = fd;
+	pfd.events = POLLIN;
+
+	while (watch_running) {
+		int ret = poll(&pfd, 1, 1000);
+
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			fprintf(stderr, "poll error: %s\n", strerror(errno));
+			break;
+		}
+		if (ret == 0)
+			continue;
+
+		if (pfd.revents & POLLIN) {
+			ssize_t n = read(fd, rbuf, sizeof(rbuf));
+
+			if (n < 0) {
+				if (errno == EINTR)
+					continue;
+				fprintf(stderr, "read error: %s\n",
+					strerror(errno));
+				break;
+			}
+			if (n == 0)
+				break;
+
+			int dev_idx;
+			char label[32];
+			char dir[LBD_LOG_PATH_MAX];
+			uint64_t log_seq, device_size;
+
+			if (decode_watch_event(rbuf, (size_t)n,
+					       &dev_idx, label, sizeof(label),
+					       dir, sizeof(dir),
+					       &log_seq, &device_size) < 0) {
+				fprintf(stderr, "Failed to decode event\n");
+				continue;
+			}
+
+			if (json) {
+				printf("{\"type\":\"log_rotated\","
+				       "\"dev\":%d,"
+				       "\"segment_label\":\"%s\","
+				       "\"log_dir\":",
+				       dev_idx, label);
+				json_print_string(stdout, dir);
+				printf(",\"log_seq\":%llu,"
+				       "\"device_size\":%llu}\n",
+				       (unsigned long long)log_seq,
+				       (unsigned long long)device_size);
+			} else {
+				printf("lbd%d: %s/disk.%s.log (seq=%llu)\n",
+				       dev_idx, dir, label,
+				       (unsigned long long)log_seq);
+			}
+			fflush(stdout);
+		}
+
+		if (pfd.revents & (POLLERR | POLLHUP))
+			break;
+	}
+
+	close(fd);
+	return 0;
+}
+
+/* ----------------------------------------------------------------
  * Main
  * ---------------------------------------------------------------- */
 
@@ -1898,6 +2247,7 @@ static void usage(void)
 		"  lbdctl add [opts] <path>           Create a new lbd device backed by <path>\n"
 		"  lbdctl remove <N>                  Remove /dev/lbdN\n"
 		"  lbdctl list                        List all active lbd devices\n"
+		"  lbdctl watch [opts]                Watch for log rotation events\n"
 		"  lbdctl log [opts] <logfile>        Read and display a log file\n"
 		"  lbdctl create --size <S> <path>    Create empty qcow2-lz4 image\n"
 		"  lbdctl convert <flat> <qcow2>      Convert flat image to qcow2-lz4\n"
@@ -1909,6 +2259,10 @@ static void usage(void)
 		"  --base <path>            Read-only base layer image (thin snapshot)\n"
 		"  --log-max-size <bytes>   Segment rotation size (default 64 MiB)\n"
 		"  --log-max-age <secs>     Segment rotation age (default 60s)\n"
+		"\n"
+		"Watch options:\n"
+		"  --dev <N>      Only watch device N (default: all)\n"
+		"  --json         Output events as JSON\n"
 		"\n"
 		"Create options:\n"
 		"  --size <bytes>           Virtual device size (supports K/M/G/T suffixes)\n"
@@ -1944,6 +2298,10 @@ int main(int argc, char **argv)
 
 	if (strcmp(argv[1], "list") == 0) {
 		return cmd_list();
+	}
+
+	if (strcmp(argv[1], "watch") == 0) {
+		return cmd_watch(argc - 2, argv + 2);
 	}
 
 	if (strcmp(argv[1], "create") == 0) {
