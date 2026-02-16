@@ -24,6 +24,7 @@
 #include <linux/falloc.h>
 
 #include "lbd.h"
+#include "lbd_qcow2.h"
 #include "cbor_enc.h"
 #include "lz4_kcompat.h"
 
@@ -70,6 +71,9 @@ static int lbd_do_read(struct lbd_device *dev, struct request *rq)
 	struct bio_vec bvec;
 	loff_t pos = (loff_t)blk_rq_pos(rq) << SECTOR_SHIFT;
 	ssize_t ret;
+
+	if (dev->is_qcow2)
+		return lbd_qcow2_read(dev, rq);
 
 	rq_for_each_segment(bvec, rq, iter) {
 		void *mapped = kmap_local_page(bvec.bv_page);
@@ -276,6 +280,16 @@ static int lbd_do_write(struct lbd_device *dev, struct request *rq)
 	loff_t pos = (loff_t)blk_rq_pos(rq) << SECTOR_SHIFT;
 	ssize_t ret;
 
+	if (dev->is_qcow2) {
+		ret = lbd_qcow2_write(dev, rq);
+		if (ret)
+			return ret;
+		lbd_log_write(dev, rq);
+		atomic64_inc(&dev->stat_writes);
+		atomic64_add(blk_rq_bytes(rq), &dev->stat_write_bytes);
+		return 0;
+	}
+
 	rq_for_each_segment(bvec, rq, iter) {
 		void *mapped = kmap_local_page(bvec.bv_page);
 
@@ -356,6 +370,16 @@ static int lbd_do_discard(struct lbd_device *dev, struct request *rq)
 	loff_t pos = (loff_t)blk_rq_pos(rq) << SECTOR_SHIFT;
 	unsigned int len = blk_rq_bytes(rq);
 	int ret;
+
+	if (dev->is_qcow2) {
+		ret = lbd_qcow2_discard(dev, rq);
+		if (ret)
+			return ret;
+		lbd_log_discard(dev, rq);
+		atomic64_inc(&dev->stat_trims);
+		atomic64_add(len, &dev->stat_trim_bytes);
+		return 0;
+	}
 
 	if (dev->backing_file->f_op->fallocate) {
 		ret = dev->backing_file->f_op->fallocate(dev->backing_file,
@@ -704,6 +728,13 @@ static void lbd_destroy_device(struct lbd_device *dev)
 	destroy_workqueue(dev->wq);
 
 	lbd_finalize_log(dev);
+
+	if (dev->base)
+		lbd_qcow2_base_destroy(dev->base);
+
+	if (dev->is_qcow2)
+		lbd_qcow2_destroy(dev);
+
 	kvfree(dev->lz4_state);
 	kvfree(dev->log_buf);
 	path_put(&dev->log_dir_path);
@@ -729,6 +760,7 @@ static int lbd_add_device(struct lbd_ctl_add __user *uarg)
 
 	arg.path[LBD_LOG_PATH_MAX - 1] = '\0';
 	arg.log_dir[LBD_LOG_PATH_MAX - 1] = '\0';
+	arg.base_path[LBD_LOG_PATH_MAX - 1] = '\0';
 
 	if (arg.log_dir[0] == '\0') {
 		pr_err("lbd: log_dir is required\n");
@@ -858,12 +890,44 @@ static int lbd_add_device(struct lbd_ctl_add __user *uarg)
 		goto err_backing;
 	}
 
+	/* Detect qcow2-lz4 format */
+	{
+		u64 magic;
+		loff_t magic_pos = 0;
+		ssize_t mret;
+
+		mret = kernel_read(dev->backing_file, &magic, 8, &magic_pos);
+		if (mret == 8 && be64_to_cpu(magic) == LBD_QCOW2_MAGIC) {
+			ret = lbd_qcow2_init(dev);
+			if (ret)
+				goto err_backing;
+			dev->is_qcow2 = true;
+			dev->size = dev->qcow2.virtual_size;
+		} else {
+			dev->is_qcow2 = false;
+		}
+	}
+
+	/* Initialize base layer if requested */
+	if (arg.base_path[0] != '\0') {
+		if (!dev->is_qcow2) {
+			pr_err("lbd: base layer requires qcow2-lz4 primary\n");
+			ret = -EINVAL;
+			goto err_backing;
+		}
+		strscpy(dev->base_path, arg.base_path,
+			sizeof(dev->base_path));
+		ret = lbd_qcow2_base_init(dev, arg.base_path);
+		if (ret)
+			goto err_backing;
+	}
+
 	/* Resolve log directory */
 	ret = kern_path(dev->log_dir, LOOKUP_DIRECTORY, &dev->log_dir_path);
 	if (ret) {
 		pr_err("lbd: cannot resolve log directory '%s': %d\n",
 		       dev->log_dir, ret);
-		goto err_backing;
+		goto err_base;
 	}
 
 	/* Begin initial log segment (file created lazily on first flush) */
@@ -914,7 +978,12 @@ static int lbd_add_device(struct lbd_ctl_add __user *uarg)
 
 err_logdir:
 	path_put(&dev->log_dir_path);
+err_base:
+	if (dev->base)
+		lbd_qcow2_base_destroy(dev->base);
 err_backing:
+	if (dev->is_qcow2)
+		lbd_qcow2_destroy(dev);
 	fput(dev->backing_file);
 err_wq:
 	destroy_workqueue(dev->wq);
@@ -999,6 +1068,15 @@ static ssize_t backing_path_show(struct device *d,
 	return sysfs_emit(buf, "%s\n", dev->backing_path);
 }
 static DEVICE_ATTR_RO(backing_path);
+
+static ssize_t base_path_show(struct device *d,
+			      struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	return sysfs_emit(buf, "%s\n", dev->base ? dev->base_path : "(none)");
+}
+static DEVICE_ATTR_RO(base_path);
 
 static ssize_t log_dir_show(struct device *d,
 			    struct device_attribute *attr, char *buf)
@@ -1088,6 +1166,51 @@ static ssize_t trim_bytes_show(struct device *d,
 }
 static DEVICE_ATTR_RO(trim_bytes);
 
+static ssize_t alloc_reused_show(struct device *d,
+				 struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	return sysfs_emit(buf, "%lld\n", atomic64_read(&dev->stat_alloc_reused));
+}
+static DEVICE_ATTR_RO(alloc_reused);
+
+static ssize_t alloc_new_show(struct device *d,
+			      struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	return sysfs_emit(buf, "%lld\n", atomic64_read(&dev->stat_alloc_new));
+}
+static DEVICE_ATTR_RO(alloc_new);
+
+static ssize_t alloc_freed_show(struct device *d,
+				struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	return sysfs_emit(buf, "%lld\n", atomic64_read(&dev->stat_alloc_freed));
+}
+static DEVICE_ATTR_RO(alloc_freed);
+
+static ssize_t compressed_show(struct device *d,
+			       struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	return sysfs_emit(buf, "%lld\n", atomic64_read(&dev->stat_compressed));
+}
+static DEVICE_ATTR_RO(compressed);
+
+static ssize_t uncompressed_show(struct device *d,
+				 struct device_attribute *attr, char *buf)
+{
+	struct lbd_device *dev = dev_to_disk(d)->private_data;
+
+	return sysfs_emit(buf, "%lld\n", atomic64_read(&dev->stat_uncompressed));
+}
+static DEVICE_ATTR_RO(uncompressed);
+
 static ssize_t log_seq_show(struct device *d,
 			    struct device_attribute *attr, char *buf)
 {
@@ -1136,6 +1259,7 @@ static DEVICE_ATTR_RO(segment_age_secs);
 
 static struct attribute *lbd_attrs[] = {
 	&dev_attr_backing_path.attr,
+	&dev_attr_base_path.attr,
 	&dev_attr_log_dir.attr,
 	&dev_attr_state.attr,
 	&dev_attr_device_size.attr,
@@ -1145,6 +1269,11 @@ static struct attribute *lbd_attrs[] = {
 	&dev_attr_read_bytes.attr,
 	&dev_attr_write_bytes.attr,
 	&dev_attr_trim_bytes.attr,
+	&dev_attr_alloc_reused.attr,
+	&dev_attr_alloc_new.attr,
+	&dev_attr_alloc_freed.attr,
+	&dev_attr_compressed.attr,
+	&dev_attr_uncompressed.attr,
 	&dev_attr_log_seq.attr,
 	&dev_attr_log_segment.attr,
 	&dev_attr_log_rotations.attr,

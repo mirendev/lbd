@@ -9,6 +9,7 @@ package main
 import (
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -211,6 +212,7 @@ func runShow(cfg *showArgs) error {
 }
 
 type replayArgs struct {
+	QCow2      bool   `long:"qcow2" usage:"output as qcow2-lz4 image instead of flat file"`
 	LogDir     string `position:"0" usage:"directory containing log files"`
 	OutputPath string `position:"1" usage:"path to write reconstructed backing file"`
 }
@@ -258,7 +260,14 @@ func runReplay(cfg *replayArgs) error {
 	blockSize := firstRd.Header.BlockSize
 	firstFile.Close()
 
-	// Step C: Create output file
+	// Step C: Create output and replay
+	if cfg.QCow2 {
+		return replayToQCow2(logFiles, outputPath, deviceSize, blockSize)
+	}
+	return replayToFlat(logFiles, outputPath, deviceSize, blockSize)
+}
+
+func replayToFlat(logFiles []string, outputPath string, deviceSize uint64, blockSize uint32) error {
 	outFile, err := os.Create(outputPath)
 	if err != nil {
 		return fmt.Errorf("creating output file: %w", err)
@@ -269,7 +278,6 @@ func runReplay(cfg *replayArgs) error {
 		return fmt.Errorf("setting output file size: %w", err)
 	}
 
-	// Step D: Replay each segment in order
 	var totalEntries, totalWrites, totalTrims, crcErrors int
 	var totalBytes uint64
 
@@ -310,10 +318,17 @@ func runReplay(cfg *replayArgs) error {
 				totalWrites++
 				totalBytes += uint64(len(e.Data))
 			} else if e.IsTrim() {
-				zeros := make([]byte, e.Length)
-				if _, err := outFile.WriteAt(zeros, offset); err != nil {
+				const (
+					fallocPunchHole = 0x02 // FALLOC_FL_PUNCH_HOLE
+					fallocKeepSize  = 0x01 // FALLOC_FL_KEEP_SIZE
+				)
+				fd := int(outFile.Fd())
+				err := syscall.Fallocate(fd,
+					fallocPunchHole|fallocKeepSize,
+					offset, int64(e.Length))
+				if err != nil {
 					f.Close()
-					return fmt.Errorf("writing zeros at offset %d: %w", offset, err)
+					return fmt.Errorf("punching hole at offset %d: %w", offset, err)
 				}
 				totalTrims++
 				totalBytes += uint64(e.Length)
@@ -323,10 +338,84 @@ func runReplay(cfg *replayArgs) error {
 		f.Close()
 	}
 
-	// Step E: Print summary
 	fmt.Printf("Replayed %d entries (%d writes, %d trims) from %d segments\n",
 		totalEntries, totalWrites, totalTrims, len(logFiles))
 	fmt.Printf("Output: %s (%s)\n", outputPath, fmtSize(deviceSize))
+	fmt.Printf("CRC errors: %d\n", crcErrors)
+
+	return nil
+}
+
+func replayToQCow2(logFiles []string, outputPath string, deviceSize uint64, blockSize uint32) error {
+	img, err := lbdlog.CreateQCow2(outputPath, deviceSize, 16)
+	if err != nil {
+		return fmt.Errorf("creating qcow2 image: %w", err)
+	}
+
+	var totalEntries, totalWrites, totalTrims, crcErrors int
+	var totalBytes uint64
+
+	for _, logPath := range logFiles {
+		f, err := os.Open(logPath)
+		if err != nil {
+			img.Close()
+			return fmt.Errorf("opening %s: %w", logPath, err)
+		}
+
+		rd, err := lbdlog.NewReader(f)
+		if err != nil {
+			f.Close()
+			img.Close()
+			return fmt.Errorf("reading header from %s: %w", logPath, err)
+		}
+
+		for {
+			e, err := rd.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				f.Close()
+				img.Close()
+				return fmt.Errorf("reading entry from %s: %w", logPath, err)
+			}
+
+			totalEntries++
+			offset := int64(e.Block) * int64(blockSize)
+
+			if e.IsWrite() {
+				if !e.ValidateCRC() {
+					crcErrors++
+					fmt.Fprintf(os.Stderr, "Warning: CRC mismatch at entry seq=%d in %s\n", e.Sequence, logPath)
+				}
+				if _, err := img.WriteAt(e.Data, offset); err != nil {
+					f.Close()
+					img.Close()
+					return fmt.Errorf("writing at offset %d: %w", offset, err)
+				}
+				totalWrites++
+				totalBytes += uint64(len(e.Data))
+			} else if e.IsTrim() {
+				if err := img.Trim(offset, int(e.Length)); err != nil {
+					f.Close()
+					img.Close()
+					return fmt.Errorf("trimming at offset %d: %w", offset, err)
+				}
+				totalTrims++
+				totalBytes += uint64(e.Length)
+			}
+		}
+
+		f.Close()
+	}
+
+	if err := img.Close(); err != nil {
+		return fmt.Errorf("closing qcow2 image: %w", err)
+	}
+
+	fmt.Printf("Replayed %d entries (%d writes, %d trims) from %d segments\n",
+		totalEntries, totalWrites, totalTrims, len(logFiles))
+	fmt.Printf("Output: %s (qcow2-lz4, virtual %s)\n", outputPath, fmtSize(deviceSize))
 	fmt.Printf("CRC errors: %d\n", crcErrors)
 
 	return nil
@@ -1217,6 +1306,90 @@ func runGC(cfg *gcArgs) error {
 	return nil
 }
 
+type sumArgs struct {
+	Files []string `rest:"true" usage:"files to checksum (raw or qcow2)"`
+}
+
+func runSum(cfg *sumArgs) error {
+	if len(cfg.Files) == 0 {
+		return fmt.Errorf("at least one file required")
+	}
+
+	for _, path := range cfg.Files {
+		hexHash, err := checksumFile(path)
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		fmt.Printf("%s  %s\n", hexHash, path)
+	}
+	return nil
+}
+
+func checksumFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	// Read first 8 bytes to check for qcow2 magic
+	var magicBuf [8]byte
+	if _, err := f.ReadAt(magicBuf[:], 0); err != nil {
+		return "", fmt.Errorf("reading magic: %w", err)
+	}
+
+	magic := binary.BigEndian.Uint64(magicBuf[:])
+	if magic == lbdlog.QCow2Magic {
+		return checksumQCow2(f)
+	}
+	return checksumRaw(f)
+}
+
+func checksumRaw(f *os.File) (string, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func checksumQCow2(f *os.File) (string, error) {
+	img, err := lbdlog.OpenQCow2File(f)
+	if err != nil {
+		return "", err
+	}
+	img.SetReadOnly(true)
+
+	h := sha256.New()
+	buf := make([]byte, img.ClusterSize)
+	remaining := int64(img.VirtualSize)
+	offset := int64(0)
+
+	for remaining > 0 {
+		readLen := int64(img.ClusterSize)
+		if readLen > remaining {
+			readLen = remaining
+		}
+
+		n, err := img.ReadAt(buf[:readLen], offset)
+		if err != nil {
+			img.Close()
+			return "", fmt.Errorf("reading at offset %d: %w", offset, err)
+		}
+
+		h.Write(buf[:n])
+		offset += int64(n)
+		remaining -= int64(n)
+	}
+
+	img.Close()
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 func main() {
 	d := mflags.NewDispatcher("lbdlog")
 	d.Dispatch("show", mflags.Infer(runShow, mflags.WithUsage("Display log file contents")))
@@ -1224,10 +1397,11 @@ func main() {
 	d.Dispatch("repack", mflags.Infer(runRepack, mflags.WithUsage("Repack multiple log segments into a single file")))
 	d.Dispatch("scan", mflags.Infer(runScan, mflags.WithUsage("Scan a device for changes and write log segments")))
 	d.Dispatch("gc", mflags.Infer(runGC, mflags.WithUsage("Garbage-collect dead entries from log segments")))
+	d.Dispatch("sum", mflags.Infer(runSum, mflags.WithUsage("Output SHA-256 checksum of file data (supports raw and qcow2)")))
 
 	// Default to "show" if the first argument isn't a known subcommand
 	args := os.Args[1:]
-	if len(args) > 0 && args[0] != "show" && args[0] != "replay" && args[0] != "repack" && args[0] != "scan" && args[0] != "gc" {
+	if len(args) > 0 && args[0] != "show" && args[0] != "replay" && args[0] != "repack" && args[0] != "scan" && args[0] != "gc" && args[0] != "sum" {
 		args = append([]string{"show"}, args...)
 	}
 

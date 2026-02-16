@@ -14,6 +14,8 @@
 #include <linux/version.h>
 #include <linux/workqueue.h>
 
+#include "lbd_qcow2.h"
+
 #define LBD_NAME		"lbd"
 #define LBD_CTL_NAME		"lbd-control"
 #define LBD_VERSION		"0.1.0"
@@ -44,6 +46,7 @@ enum lbd_state {
 struct lbd_ctl_add {
 	char path[LBD_LOG_PATH_MAX];
 	char log_dir[LBD_LOG_PATH_MAX];
+	char base_path[LBD_LOG_PATH_MAX];  /* empty string = no base */
 	__s32 index;		/* out: assigned device index */
 	__u64 log_max_size;	/* 0 = default */
 	__u32 log_max_age_secs;	/* 0 = default */
@@ -123,6 +126,14 @@ struct lbd_device {
 
 	void *lz4_state;		/* LZ4 compression state, allocated once */
 
+	/* qcow2-lz4 backing store */
+	bool is_qcow2;
+	struct lbd_qcow2 qcow2;
+
+	/* Thin snapshot base layer */
+	struct lbd_qcow2_base *base;	/* NULL when no base configured */
+	char base_path[LBD_LOG_PATH_MAX];
+
 	/* I/O stats (atomic for lock-free sysfs reads) */
 	atomic64_t stat_reads;
 	atomic64_t stat_writes;
@@ -130,6 +141,13 @@ struct lbd_device {
 	atomic64_t stat_read_bytes;
 	atomic64_t stat_write_bytes;
 	atomic64_t stat_trim_bytes;
+
+	/* Allocation stats (qcow2 space reuse) */
+	atomic64_t stat_alloc_reused;	/* clusters written in-place or via free list */
+	atomic64_t stat_alloc_new;	/* clusters allocated by appending */
+	atomic64_t stat_alloc_freed;	/* extents added to the free list */
+	atomic64_t stat_compressed;	/* clusters stored compressed */
+	atomic64_t stat_uncompressed;	/* clusters stored uncompressed */
 
 	/* Log stats */
 	atomic64_t stat_log_rotations;
