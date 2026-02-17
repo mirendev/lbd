@@ -12,6 +12,7 @@
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/version.h>
+#include <linux/completion.h>
 #include <linux/workqueue.h>
 
 #include "lbd_qcow2.h"
@@ -90,6 +91,12 @@ struct lbd_ctl_info {
 /* Watch command keys (write path: userspace -> kernel) */
 #define LBD_WATCH_KEY_CMD		1
 #define LBD_WATCH_KEY_DEV		2
+#define LBD_WATCH_KEY_PATH		3   /* text: file path (for swap) */
+
+/* Miss event keys (kernel -> userspace and userspace -> kernel) */
+#define LBD_MISS_KEY_TYPE		1   /* text: event/command type */
+#define LBD_MISS_KEY_DEV		2   /* uint: device index */
+#define LBD_MISS_KEY_CLUSTER		3   /* uint: cluster index */
 
 /* Event keys (read path: kernel -> userspace) */
 #define LBD_EVENT_KEY_TYPE		1
@@ -98,6 +105,14 @@ struct lbd_ctl_info {
 #define LBD_EVENT_KEY_DIR		4
 #define LBD_EVENT_KEY_SEQ		5
 #define LBD_EVENT_KEY_SIZE		6
+
+/* Forward declaration for miss handler */
+struct lbd_miss_handler;
+
+enum lbd_miss_action {
+	LBD_MISS_CONTINUE = 0,
+	LBD_MISS_RETRY,
+};
 
 /* Per-request data (embedded in blk-mq PDU) */
 struct lbd_cmd {
@@ -146,6 +161,10 @@ struct lbd_device {
 	/* Thin snapshot base layer */
 	struct lbd_qcow2_base *base;	/* NULL when no base configured */
 	char base_path[LBD_LOG_PATH_MAX];
+
+	/* Block miss handler (for remote-fetch workflow) */
+	struct lbd_miss_handler *miss_handler;	/* NULL when no handler */
+	spinlock_t miss_handler_lock;		/* protects miss_handler pointer */
 
 	/* I/O stats (atomic for lock-free sysfs reads) */
 	atomic64_t stat_reads;

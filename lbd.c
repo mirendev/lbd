@@ -67,6 +67,30 @@ static LIST_HEAD(lbd_watchers);
 static DEFINE_SPINLOCK(lbd_watchers_lock);
 
 /* ----------------------------------------------------------------
+ * Block miss handler (for remote-fetch workflow)
+ * ---------------------------------------------------------------- */
+
+struct lbd_miss_pending {
+	struct completion       done;
+	enum lbd_miss_action    action;
+};
+
+struct lbd_miss_handler {
+	spinlock_t              lock;
+	wait_queue_head_t       wq;
+	int                     dev_index;
+	struct lbd_miss_pending *pending;    /* NULL = idle */
+	bool                    has_event;
+	u64                     miss_cluster;
+};
+
+/* Control fd state — supports both watch and miss handler on same fd */
+struct lbd_ctl_state {
+	struct lbd_watcher      *watcher;   /* NULL until "watch" command */
+	struct lbd_miss_handler *miss;      /* NULL until "manage_misses" command */
+};
+
+/* ----------------------------------------------------------------
  * Block device operations
  * ---------------------------------------------------------------- */
 
@@ -812,6 +836,7 @@ static int lbd_add_device(struct lbd_ctl_add __user *uarg)
 	strscpy(dev->log_dir, arg.log_dir, sizeof(dev->log_dir));
 	dev->state = LBD_STATE_UNBOUND;
 	spin_lock_init(&dev->cmd_lock);
+	spin_lock_init(&dev->miss_handler_lock);
 	INIT_LIST_HEAD(&dev->cmd_list);
 	INIT_WORK(&dev->work, lbd_work_fn);
 	mutex_init(&dev->log_mutex);
@@ -1329,6 +1354,69 @@ static const struct attribute_group lbd_attr_group = {
 };
 
 /* ----------------------------------------------------------------
+ * Miss handler helpers
+ * ---------------------------------------------------------------- */
+
+static struct lbd_miss_handler *lbd_miss_handler_alloc(int dev_index)
+{
+	struct lbd_miss_handler *mh;
+
+	mh = kzalloc(sizeof(*mh), GFP_KERNEL);
+	if (!mh)
+		return NULL;
+
+	spin_lock_init(&mh->lock);
+	init_waitqueue_head(&mh->wq);
+	mh->dev_index = dev_index;
+	mh->pending = NULL;
+	mh->has_event = false;
+	return mh;
+}
+
+/*
+ * Called from I/O workqueue when a cluster miss is detected.
+ * Posts the miss event to the handler and blocks until userspace responds.
+ * rwsem must be RELEASED before calling this.
+ */
+enum lbd_miss_action lbd_qcow2_handle_miss(struct lbd_device *dev,
+					    u64 cluster_index)
+{
+	struct lbd_miss_handler *mh;
+	struct lbd_miss_pending pending;
+
+	init_completion(&pending.done);
+	pending.action = LBD_MISS_CONTINUE;
+
+	/*
+	 * Hold miss_handler_lock while setting mh->pending to prevent
+	 * lbd_ctl_release() from freeing mh between our read of the
+	 * pointer and the registration of the pending completion.
+	 * Once pending is registered, release will complete() it
+	 * before kfree(mh), so mh stays alive until we wake up.
+	 */
+	spin_lock(&dev->miss_handler_lock);
+	mh = dev->miss_handler;
+	if (!mh) {
+		spin_unlock(&dev->miss_handler_lock);
+		return LBD_MISS_CONTINUE;
+	}
+
+	spin_lock(&mh->lock);
+	mh->pending = &pending;
+	mh->miss_cluster = cluster_index;
+	mh->has_event = true;
+	spin_unlock(&mh->lock);
+	spin_unlock(&dev->miss_handler_lock);
+
+	wake_up_interruptible(&mh->wq);
+
+	/* Block I/O thread until userspace responds */
+	wait_for_completion(&pending.done);
+
+	return pending.action;
+}
+
+/* ----------------------------------------------------------------
  * Watcher helpers
  * ---------------------------------------------------------------- */
 
@@ -1422,38 +1510,78 @@ static void lbd_notify_watchers(struct lbd_device *dev)
 
 static int lbd_ctl_open(struct inode *inode, struct file *file)
 {
-	file->private_data = NULL;
+	struct lbd_ctl_state *state;
+
+	state = kzalloc(sizeof(*state), GFP_KERNEL);
+	if (!state)
+		return -ENOMEM;
+
+	file->private_data = state;
 	return 0;
 }
 
 static int lbd_ctl_release(struct inode *inode, struct file *file)
 {
-	struct lbd_watcher *w = file->private_data;
+	struct lbd_ctl_state *state = file->private_data;
 
-	if (w) {
+	if (!state)
+		return 0;
+
+	if (state->watcher) {
 		spin_lock(&lbd_watchers_lock);
-		list_del(&w->list);
+		list_del(&state->watcher->list);
 		spin_unlock(&lbd_watchers_lock);
-		kfree(w);
-		file->private_data = NULL;
+		kfree(state->watcher);
 	}
+
+	if (state->miss) {
+		struct lbd_miss_handler *mh = state->miss;
+		struct lbd_device *dev;
+
+		/* Find the device and clear its handler pointer */
+		mutex_lock(&lbd_devices_mutex);
+		dev = idr_find(&lbd_devices, mh->dev_index);
+		if (dev) {
+			spin_lock(&dev->miss_handler_lock);
+			if (dev->miss_handler == mh)
+				dev->miss_handler = NULL;
+			spin_unlock(&dev->miss_handler_lock);
+		}
+		mutex_unlock(&lbd_devices_mutex);
+
+		/* Complete any pending miss with CONTINUE */
+		spin_lock(&mh->lock);
+		if (mh->pending) {
+			mh->pending->action = LBD_MISS_CONTINUE;
+			complete(&mh->pending->done);
+			mh->pending = NULL;
+		}
+		spin_unlock(&mh->lock);
+
+		kfree(mh);
+	}
+
+	kfree(state);
+	file->private_data = NULL;
 	return 0;
 }
 
 static ssize_t lbd_ctl_write(struct file *file, const char __user *ubuf,
 			     size_t count, loff_t *ppos)
 {
-	u8 kbuf[64];
+	struct lbd_ctl_state *state = file->private_data;
+	u8 kbuf[512];
 	struct cbor_dec d;
 	u64 map_count, key;
 	char cmd[16];
 	int filter_dev = -1;
 	bool have_cmd = false;
-	struct lbd_watcher *w;
+	char path[LBD_LOG_PATH_MAX];
+	bool have_path = false;
 	u64 i;
 
-	if (file->private_data)
-		return -EBUSY;
+	if (!state)
+		return -EINVAL;
 
 	if (count > sizeof(kbuf))
 		return -EINVAL;
@@ -1465,6 +1593,8 @@ static ssize_t lbd_ctl_write(struct file *file, const char __user *ubuf,
 
 	if (cbor_dec_map(&d, &map_count))
 		return -EINVAL;
+
+	path[0] = '\0';
 
 	for (i = 0; i < map_count; i++) {
 		if (cbor_dec_uint(&d, &key))
@@ -1483,103 +1613,333 @@ static ssize_t lbd_ctl_write(struct file *file, const char __user *ubuf,
 			filter_dev = (int)dev_val;
 			break;
 		}
+		case LBD_WATCH_KEY_PATH:
+			if (cbor_dec_text(&d, path, sizeof(path), NULL))
+				return -EINVAL;
+			have_path = true;
+			break;
 		default:
 			return -EINVAL;
 		}
 	}
 
-	if (!have_cmd || strcmp(cmd, "watch") != 0)
+	if (!have_cmd)
 		return -EINVAL;
 
-	w = lbd_watcher_alloc(filter_dev);
-	if (!w)
-		return -ENOMEM;
+	if (strcmp(cmd, "watch") == 0) {
+		struct lbd_watcher *w;
 
-	spin_lock(&lbd_watchers_lock);
-	list_add_tail(&w->list, &lbd_watchers);
-	spin_unlock(&lbd_watchers_lock);
+		if (state->watcher)
+			return -EBUSY;
 
-	file->private_data = w;
-	return count;
+		w = lbd_watcher_alloc(filter_dev);
+		if (!w)
+			return -ENOMEM;
+
+		spin_lock(&lbd_watchers_lock);
+		list_add_tail(&w->list, &lbd_watchers);
+		spin_unlock(&lbd_watchers_lock);
+
+		state->watcher = w;
+		return count;
+	}
+
+	if (strcmp(cmd, "manage_misses") == 0) {
+		struct lbd_device *dev;
+		struct lbd_miss_handler *mh;
+
+		if (state->miss)
+			return -EBUSY;
+		if (filter_dev < 0)
+			return -EINVAL;
+
+		mh = lbd_miss_handler_alloc(filter_dev);
+		if (!mh)
+			return -ENOMEM;
+
+		mutex_lock(&lbd_devices_mutex);
+		dev = idr_find(&lbd_devices, filter_dev);
+		if (!dev) {
+			mutex_unlock(&lbd_devices_mutex);
+			kfree(mh);
+			return -ENODEV;
+		}
+		if (!dev->is_qcow2) {
+			mutex_unlock(&lbd_devices_mutex);
+			kfree(mh);
+			return -EINVAL;
+		}
+
+		spin_lock(&dev->miss_handler_lock);
+		if (dev->miss_handler) {
+			spin_unlock(&dev->miss_handler_lock);
+			mutex_unlock(&lbd_devices_mutex);
+			kfree(mh);
+			return -EBUSY;
+		}
+		dev->miss_handler = mh;
+		spin_unlock(&dev->miss_handler_lock);
+		mutex_unlock(&lbd_devices_mutex);
+
+		state->miss = mh;
+		return count;
+	}
+
+	if (strcmp(cmd, "continue") == 0) {
+		struct lbd_miss_handler *mh = state->miss;
+
+		if (!mh)
+			return -EINVAL;
+
+		spin_lock(&mh->lock);
+		if (!mh->pending) {
+			spin_unlock(&mh->lock);
+			return -EINVAL;
+		}
+		mh->pending->action = LBD_MISS_CONTINUE;
+		complete(&mh->pending->done);
+		mh->pending = NULL;
+		mh->has_event = false;
+		spin_unlock(&mh->lock);
+
+		return count;
+	}
+
+	if (strcmp(cmd, "retry") == 0) {
+		struct lbd_miss_handler *mh = state->miss;
+
+		if (!mh)
+			return -EINVAL;
+
+		spin_lock(&mh->lock);
+		if (!mh->pending) {
+			spin_unlock(&mh->lock);
+			return -EINVAL;
+		}
+		mh->pending->action = LBD_MISS_RETRY;
+		complete(&mh->pending->done);
+		mh->pending = NULL;
+		mh->has_event = false;
+		spin_unlock(&mh->lock);
+
+		return count;
+	}
+
+	if (strcmp(cmd, "swap") == 0) {
+		struct lbd_device *dev;
+		struct lbd_miss_handler *mh = state->miss;
+		int ret;
+
+		if (!mh)
+			return -EINVAL;
+		if (!have_path || path[0] == '\0')
+			return -EINVAL;
+
+		mutex_lock(&lbd_devices_mutex);
+		dev = idr_find(&lbd_devices, mh->dev_index);
+		if (!dev) {
+			mutex_unlock(&lbd_devices_mutex);
+			return -ENODEV;
+		}
+		mutex_unlock(&lbd_devices_mutex);
+
+		ret = lbd_qcow2_swap_base(dev, path);
+		if (ret)
+			return ret;
+
+		return count;
+	}
+
+	return -EINVAL;
+}
+
+static bool lbd_ctl_has_event(struct lbd_ctl_state *state)
+{
+	struct lbd_miss_handler *mh = state->miss;
+	struct lbd_watcher *w = state->watcher;
+	struct lbd_watcher_event ev;
+
+	if (mh) {
+		bool has;
+
+		spin_lock(&mh->lock);
+		has = mh->has_event;
+		spin_unlock(&mh->lock);
+		if (has)
+			return true;
+	}
+	if (w && lbd_watcher_peek(w, &ev))
+		return true;
+	return false;
 }
 
 static ssize_t lbd_ctl_read(struct file *file, char __user *ubuf,
 			    size_t count, loff_t *ppos)
 {
-	struct lbd_watcher *w = file->private_data;
-	struct lbd_watcher_event ev;
+	struct lbd_ctl_state *state = file->private_data;
+	struct lbd_miss_handler *mh;
+	struct lbd_watcher *w;
 	u8 tmp[512];
 	struct cbor_enc e;
 	size_t encoded_len;
-	size_t label_len, dir_len;
 
-	if (!w)
+	if (!state)
 		return -EINVAL;
 
-	/* Block until an event is available (or EAGAIN for nonblock) */
-	if (!lbd_watcher_peek(w, &ev)) {
+	mh = state->miss;
+	w = state->watcher;
+
+	if (!mh && !w)
+		return -EINVAL;
+
+	/* Block until an event is available */
+	if (!lbd_ctl_has_event(state)) {
+		int ret;
+
 		if (file->f_flags & O_NONBLOCK)
 			return -EAGAIN;
 
-		if (wait_event_interruptible(w->wq,
-					     lbd_watcher_peek(w, &ev)))
+		if (mh) {
+			ret = wait_event_interruptible(mh->wq,
+				lbd_ctl_has_event(state));
+		} else {
+			ret = wait_event_interruptible(w->wq,
+				lbd_ctl_has_event(state));
+		}
+		if (ret)
 			return -ERESTARTSYS;
 	}
 
-	/* Encode event to CBOR */
-	cbor_enc_init(&e, tmp, sizeof(tmp));
-	cbor_enc_map(&e, 6);
+	/* Miss events take priority (time-critical, I/O thread blocked) */
+	if (mh) {
+		bool has;
 
-	cbor_enc_uint(&e, LBD_EVENT_KEY_TYPE);
-	cbor_enc_text(&e, "log_rotated", 11);
+		spin_lock(&mh->lock);
+		has = mh->has_event;
+		spin_unlock(&mh->lock);
 
-	cbor_enc_uint(&e, LBD_EVENT_KEY_DEV);
-	cbor_enc_uint(&e, (u64)ev.dev_index);
+		if (has) {
+			u64 cluster;
 
-	cbor_enc_uint(&e, LBD_EVENT_KEY_LABEL);
-	label_len = strlen(ev.segment_label);
-	cbor_enc_text(&e, ev.segment_label, label_len);
+			spin_lock(&mh->lock);
+			cluster = mh->miss_cluster;
+			spin_unlock(&mh->lock);
 
-	cbor_enc_uint(&e, LBD_EVENT_KEY_DIR);
-	dir_len = strlen(ev.log_dir);
-	cbor_enc_text(&e, ev.log_dir, dir_len);
+			cbor_enc_init(&e, tmp, sizeof(tmp));
+			cbor_enc_map(&e, 3);
 
-	cbor_enc_uint(&e, LBD_EVENT_KEY_SEQ);
-	cbor_enc_uint(&e, ev.log_seq);
+			cbor_enc_uint(&e, LBD_MISS_KEY_TYPE);
+			cbor_enc_text(&e, "block_miss", 10);
 
-	cbor_enc_uint(&e, LBD_EVENT_KEY_SIZE);
-	cbor_enc_uint(&e, ev.device_size);
+			cbor_enc_uint(&e, LBD_MISS_KEY_DEV);
+			cbor_enc_uint(&e, (u64)mh->dev_index);
 
-	if (e.err)
-		return -EINVAL;
+			cbor_enc_uint(&e, LBD_MISS_KEY_CLUSTER);
+			cbor_enc_uint(&e, cluster);
 
-	encoded_len = cbor_enc_len(&e);
-	if (count < encoded_len)
-		return -EINVAL;
+			if (e.err)
+				return -EINVAL;
 
-	if (copy_to_user(ubuf, tmp, encoded_len))
-		return -EFAULT;
+			encoded_len = cbor_enc_len(&e);
+			if (count < encoded_len)
+				return -EINVAL;
 
-	/* Only dequeue after successful copy_to_user */
-	lbd_watcher_pop(w);
-	return encoded_len;
+			if (copy_to_user(ubuf, tmp, encoded_len))
+				return -EFAULT;
+
+			return encoded_len;
+		}
+	}
+
+	/* Fall through to watcher events */
+	if (w) {
+		struct lbd_watcher_event ev;
+		size_t label_len, dir_len;
+
+		if (!lbd_watcher_peek(w, &ev)) {
+			if (file->f_flags & O_NONBLOCK)
+				return -EAGAIN;
+
+			if (wait_event_interruptible(w->wq,
+						     lbd_watcher_peek(w, &ev)))
+				return -ERESTARTSYS;
+		}
+
+		cbor_enc_init(&e, tmp, sizeof(tmp));
+		cbor_enc_map(&e, 6);
+
+		cbor_enc_uint(&e, LBD_EVENT_KEY_TYPE);
+		cbor_enc_text(&e, "log_rotated", 11);
+
+		cbor_enc_uint(&e, LBD_EVENT_KEY_DEV);
+		cbor_enc_uint(&e, (u64)ev.dev_index);
+
+		cbor_enc_uint(&e, LBD_EVENT_KEY_LABEL);
+		label_len = strlen(ev.segment_label);
+		cbor_enc_text(&e, ev.segment_label, label_len);
+
+		cbor_enc_uint(&e, LBD_EVENT_KEY_DIR);
+		dir_len = strlen(ev.log_dir);
+		cbor_enc_text(&e, ev.log_dir, dir_len);
+
+		cbor_enc_uint(&e, LBD_EVENT_KEY_SEQ);
+		cbor_enc_uint(&e, ev.log_seq);
+
+		cbor_enc_uint(&e, LBD_EVENT_KEY_SIZE);
+		cbor_enc_uint(&e, ev.device_size);
+
+		if (e.err)
+			return -EINVAL;
+
+		encoded_len = cbor_enc_len(&e);
+		if (count < encoded_len)
+			return -EINVAL;
+
+		if (copy_to_user(ubuf, tmp, encoded_len))
+			return -EFAULT;
+
+		lbd_watcher_pop(w);
+		return encoded_len;
+	}
+
+	return -EAGAIN;
 }
 
 static __poll_t lbd_ctl_poll(struct file *file,
 			     struct poll_table_struct *wait)
 {
-	struct lbd_watcher *w = file->private_data;
+	struct lbd_ctl_state *state = file->private_data;
+	struct lbd_miss_handler *mh;
+	struct lbd_watcher *w;
 	__poll_t mask = 0;
 
-	if (!w)
+	if (!state)
 		return 0;
 
-	poll_wait(file, &w->wq, wait);
+	mh = state->miss;
+	w = state->watcher;
 
-	spin_lock(&w->lock);
-	if (w->count > 0)
-		mask |= EPOLLIN | EPOLLRDNORM;
-	spin_unlock(&w->lock);
+	if (!mh && !w)
+		return 0;
+
+	if (mh)
+		poll_wait(file, &mh->wq, wait);
+	if (w)
+		poll_wait(file, &w->wq, wait);
+
+	if (mh) {
+		spin_lock(&mh->lock);
+		if (mh->has_event)
+			mask |= EPOLLIN | EPOLLRDNORM;
+		spin_unlock(&mh->lock);
+	}
+
+	if (w) {
+		spin_lock(&w->lock);
+		if (w->count > 0)
+			mask |= EPOLLIN | EPOLLRDNORM;
+		spin_unlock(&w->lock);
+	}
 
 	return mask;
 }
