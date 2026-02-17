@@ -14,9 +14,10 @@
  * ---------------------------------------------------------------- */
 
 #define LBD_QCOW2_MAGIC		0x4C42444351573200ULL  /* "LBDQCW2\0" */
-#define LBD_QCOW2_VERSION		1
+#define LBD_QCOW2_VERSION		2
 #define LBD_QCOW2_COMP_LZ4		1
 #define LBD_QCOW2_HEADER_SIZE		4096
+#define LBD_QCOW2_L2_TRAILER_SIZE	8	/* 4 bytes reserved + 4 bytes CRC32C */
 
 /* Header field byte offsets */
 #define LBD_QCOW2_OFF_MAGIC		0	/* u64 */

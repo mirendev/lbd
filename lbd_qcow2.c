@@ -264,8 +264,19 @@ lbd_qcow2_l2_get(struct lbd_device *dev, u32 l1_index)
 
 			disk_l2 = kvmalloc(q->cluster_size, GFP_NOIO);
 			if (disk_l2) {
+				u8 *raw = (u8 *)disk_l2;
+				u32 crc;
+				__be32 crc_be;
+
+				memset(disk_l2, 0, q->cluster_size);
 				for (j = 0; j < q->l2_entries; j++)
 					disk_l2[j] = cpu_to_be64(best->table[j]);
+
+				/* CRC32C trailer */
+				crc = ~__crc32c_le(~0, raw, q->cluster_size - 4);
+				crc_be = cpu_to_be32(crc);
+				memcpy(raw + q->cluster_size - 4, &crc_be, 4);
+
 				ret = kernel_write(dev->backing_file, disk_l2,
 						   q->cluster_size, &pos);
 				if (ret != q->cluster_size)
@@ -304,6 +315,23 @@ lbd_qcow2_l2_get(struct lbd_device *dev, u32 l1_index)
 			return NULL;
 		}
 
+		/* Verify CRC32C trailer */
+		{
+			u8 *raw = (u8 *)disk_l2;
+			u32 stored_crc = _qcow2_get32(raw, q->cluster_size - 4);
+			u32 calc_crc = ~__crc32c_le(~0, raw, q->cluster_size - 4);
+
+			if (stored_crc != calc_crc) {
+				pr_warn("lbd%d: L2 CRC32C mismatch for l1[%u]: "
+					"stored=0x%08x computed=0x%08x\n",
+					dev->index, l1_index,
+					stored_crc, calc_crc);
+				kvfree(disk_l2);
+				best->valid = false;
+				return NULL;
+			}
+		}
+
 		for (j = 0; j < q->l2_entries; j++)
 			best->table[j] = be64_to_cpu(disk_l2[j]);
 
@@ -339,8 +367,18 @@ static int lbd_qcow2_l2_flush(struct lbd_device *dev,
 	if (!disk_l2)
 		return -ENOMEM;
 
+	memset(disk_l2, 0, q->cluster_size);
 	for (j = 0; j < q->l2_entries; j++)
 		disk_l2[j] = cpu_to_be64(e->table[j]);
+
+	/* Compute and store CRC32C trailer at end of cluster */
+	{
+		u8 *raw = (u8 *)disk_l2;
+		u32 crc = ~__crc32c_le(~0, raw, q->cluster_size - 4);
+		__be32 crc_be = cpu_to_be32(crc);
+
+		memcpy(raw + q->cluster_size - 4, &crc_be, 4);
+	}
 
 	pos = l2_phys;
 	ret = kernel_write(dev->backing_file, disk_l2, q->cluster_size, &pos);
@@ -371,12 +409,21 @@ static int lbd_qcow2_l2_alloc(struct lbd_device *dev, u32 l1_index)
 	q->l1_table[l1_index] = q->alloc_offset;
 	q->alloc_offset += q->cluster_size;
 
-	/* Write zeroed L2 table to disk */
+	/* Write zeroed L2 table to disk (with CRC32C trailer) */
 	{
-		void *zeros = kvmalloc(q->cluster_size, GFP_NOIO);
+		u8 *zeros = kvmalloc(q->cluster_size, GFP_NOIO);
+		u32 crc;
+		__be32 crc_be;
+
 		if (!zeros)
 			return -ENOMEM;
 		memset(zeros, 0, q->cluster_size);
+
+		/* CRC32C of all-zero data (covers bytes [0, cluster_size-4)) */
+		crc = ~__crc32c_le(~0, zeros, q->cluster_size - 4);
+		crc_be = cpu_to_be32(crc);
+		memcpy(zeros + q->cluster_size - 4, &crc_be, 4);
+
 		pos = q->l1_table[l1_index];
 		ret = kernel_write(dev->backing_file, zeros,
 				   q->cluster_size, &pos);
@@ -454,6 +501,29 @@ lbd_qcow2_cl_alloc_entry(struct lbd_qcow2 *q)
 	return best;
 }
 
+/*
+ * Return a zeroed cache entry for write path when cluster is unallocated.
+ * Caller holds q->rwsem for write.
+ */
+static struct lbd_cl_cache_entry *
+lbd_qcow2_cl_get_zero(struct lbd_device *dev, u64 cluster_index)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	struct lbd_cl_cache_entry *ce;
+
+	ce = lbd_qcow2_cl_find(q, cluster_index);
+	if (ce)
+		return ce;
+
+	ce = lbd_qcow2_cl_alloc_entry(q);
+	ce->cluster_index = cluster_index;
+	ce->lru = lbd_qcow2_lru_tick(q);
+	ce->dirty = false;
+	memset(ce->data, 0, q->cluster_size);
+	ce->valid = true;
+	return ce;
+}
+
 /* Load a cluster into cache from disk via L2 lookup */
 static struct lbd_cl_cache_entry *
 lbd_qcow2_cl_load(struct lbd_device *dev, u64 cluster_index)
@@ -490,8 +560,19 @@ lbd_qcow2_cl_load(struct lbd_device *dev, u64 cluster_index)
 		if (dev->base) {
 			int err = lbd_qcow2_base_read_cluster(dev,
 					cluster_index, ce->data);
-			if (err)
-				return NULL;
+			if (err == 1) {
+				/* Unallocated in both primary and base */
+				if (dev->miss_handler)
+					return ERR_PTR(-ENODATA);
+				/* No handler: zero-fill (backward compatible) */
+				memset(ce->data, 0, q->cluster_size);
+			} else if (err < 0) {
+				return NULL; /* I/O error */
+			}
+			/* err == 0: data was read successfully */
+		} else if (dev->miss_handler) {
+			/* No base, but miss handler registered */
+			return ERR_PTR(-ENODATA);
 		} else {
 			memset(ce->data, 0, q->cluster_size);
 		}
@@ -617,7 +698,7 @@ int lbd_qcow2_init(struct lbd_device *dev)
 	}
 
 	q->cluster_size = 1U << q->cluster_bits;
-	q->l2_entries = q->cluster_size / sizeof(u64);
+	q->l2_entries = (q->cluster_size - LBD_QCOW2_L2_TRAILER_SIZE) / sizeof(u64);
 	q->virtual_size = lbd_qcow2_hdr_virtual_size(hdr);
 	q->l1_offset = lbd_qcow2_hdr_l1_table_offset(hdr);
 	q->l1_size = lbd_qcow2_hdr_l1_size(hdr);
@@ -738,6 +819,46 @@ void lbd_qcow2_destroy(struct lbd_device *dev)
 }
 
 /* ----------------------------------------------------------------
+ * Miss handler support
+ * ---------------------------------------------------------------- */
+
+/* Declared in lbd.c, defined there to access miss handler internals */
+enum lbd_miss_action lbd_qcow2_handle_miss(struct lbd_device *dev,
+					    u64 cluster_index);
+
+/*
+ * Invalidate cached entries for a cluster before retry.
+ * Called with rwsem released.
+ */
+static void lbd_qcow2_invalidate_for_retry(struct lbd_device *dev,
+					    u64 cluster_index)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	struct lbd_qcow2_base *base = dev->base;
+	int i;
+
+	/* Invalidate primary cluster cache */
+	for (i = 0; i < LBD_QCOW2_CL_CACHE_SIZE; i++) {
+		struct lbd_cl_cache_entry *e = &q->cl_cache[i];
+
+		if (e->valid && e->cluster_index == cluster_index)
+			e->valid = false;
+	}
+
+	/* Invalidate base L2 cache entry covering this cluster */
+	if (base && base->is_qcow2) {
+		u32 l1_idx = cluster_index / base->l2_entries;
+
+		for (i = 0; i < LBD_QCOW2_L2_CACHE_SIZE; i++) {
+			struct lbd_l2_cache_entry *e = &base->l2_cache[i];
+
+			if (e->valid && e->l1_index == l1_idx)
+				e->valid = false;
+		}
+	}
+}
+
+/* ----------------------------------------------------------------
  * Read path
  * ---------------------------------------------------------------- */
 
@@ -761,11 +882,31 @@ int lbd_qcow2_read(struct lbd_device *dev, struct request *rq)
 			u32 bytes = min_t(u32, remaining,
 					  q->cluster_size - off_in_cluster);
 			struct lbd_cl_cache_entry *ce;
+			int retries = 0;
 
+retry_cluster:
 			down_read(&q->rwsem);
 
 			ce = lbd_qcow2_cl_load(dev, cluster_idx);
+			if (IS_ERR(ce)) {
+				enum lbd_miss_action action;
+
+				up_read(&q->rwsem);
+				/* -ENODATA = miss, ask userspace */
+				action = lbd_qcow2_handle_miss(dev,
+							       cluster_idx);
+				if (action == LBD_MISS_RETRY &&
+				    retries++ < 3) {
+					lbd_qcow2_invalidate_for_retry(dev,
+								       cluster_idx);
+					goto retry_cluster;
+				}
+				/* CONTINUE or retry exhausted: zero-fill */
+				memset(mapped + bv_off, 0, bytes);
+				goto next_chunk;
+			}
 			if (!ce) {
+				/* Real I/O error */
 				up_read(&q->rwsem);
 				kunmap_local(mapped);
 				return -EIO;
@@ -776,6 +917,7 @@ int lbd_qcow2_read(struct lbd_device *dev, struct request *rq)
 
 			up_read(&q->rwsem);
 
+next_chunk:
 			bv_off += bytes;
 			guest_offset += bytes;
 			remaining -= bytes;
@@ -845,7 +987,19 @@ int lbd_qcow2_write(struct lbd_device *dev, struct request *rq)
 
 		/* Load existing cluster into cache (or zeros if new) */
 		ce = lbd_qcow2_cl_load(dev, cluster_idx);
-		if (!ce) {
+		if (IS_ERR(ce)) {
+			/*
+			 * -ENODATA: cluster unallocated (miss).  For writes we
+			 * don't need the old data — just grab a zeroed cache
+			 * slot and let the write overwrite it.
+			 */
+			ce = lbd_qcow2_cl_get_zero(dev, cluster_idx);
+			if (!ce) {
+				up_write(&q->rwsem);
+				kvfree(write_data);
+				return -EIO;
+			}
+		} else if (!ce) {
 			up_write(&q->rwsem);
 			kvfree(write_data);
 			return -EIO;
@@ -1053,6 +1207,13 @@ int lbd_qcow2_discard(struct lbd_device *dev, struct request *rq)
 			}
 
 			ce = lbd_qcow2_cl_load(dev, cluster_idx);
+			if (IS_ERR(ce)) {
+				/*
+				 * -ENODATA: cluster unallocated.  Trimming
+				 * an unallocated cluster is a no-op.
+				 */
+				goto next;
+			}
 			if (!ce) {
 				up_write(&q->rwsem);
 				return -EIO;
@@ -1257,6 +1418,22 @@ lbd_qcow2_base_l2_get(struct lbd_qcow2_base *base, u32 l1_index)
 			return NULL;
 		}
 
+		/* Verify CRC32C trailer */
+		{
+			u8 *raw = (u8 *)disk_l2;
+			u32 stored_crc = _qcow2_get32(raw, base->cluster_size - 4);
+			u32 calc_crc = ~__crc32c_le(~0, raw, base->cluster_size - 4);
+
+			if (stored_crc != calc_crc) {
+				pr_warn("lbd: base L2 CRC32C mismatch for l1[%u]: "
+					"stored=0x%08x computed=0x%08x\n",
+					l1_index, stored_crc, calc_crc);
+				kvfree(disk_l2);
+				best->valid = false;
+				return NULL;
+			}
+		}
+
 		for (j = 0; j < base->l2_entries; j++)
 			best->table[j] = be64_to_cpu(disk_l2[j]);
 
@@ -1286,8 +1463,8 @@ static int lbd_qcow2_base_read_cluster(struct lbd_device *dev,
 		ssize_t ret;
 
 		if (pos + cluster_size > base->size) {
-			memset(buf, 0, cluster_size);
-			return 0;
+			/* Unallocated: signal with return 1 */
+			return 1;
 		}
 
 		ret = kernel_read(base->file, buf, cluster_size, &pos);
@@ -1314,8 +1491,8 @@ static int lbd_qcow2_base_read_cluster(struct lbd_device *dev,
 		l2_entry = l2e->table[l2_idx];
 
 		if (l2_entry == 0) {
-			memset(buf, 0, cluster_size);
-			return 0;
+			/* Unallocated in base: signal with return 1 */
+			return 1;
 		}
 
 		phys_offset = l2_entry & LBD_QCOW2_L2_OFFSET_MASK;
@@ -1370,6 +1547,142 @@ static int lbd_qcow2_base_read_cluster(struct lbd_device *dev,
 		}
 	}
 
+	return 0;
+}
+
+/* ----------------------------------------------------------------
+ * Swap base layer and reload L1
+ * ---------------------------------------------------------------- */
+
+/*
+ * Re-read the primary's L1 table from disk.
+ * Called with rwsem held for write.
+ */
+static int lbd_qcow2_reload_l1(struct lbd_qcow2 *q, struct lbd_device *dev)
+{
+	u8 *hdr;
+	loff_t pos = 0;
+	ssize_t ret;
+	__be64 *disk_l1;
+	u64 *new_l1;
+	u32 new_l1_size;
+	loff_t new_l1_offset;
+	int i;
+
+	hdr = kvmalloc(LBD_QCOW2_HEADER_SIZE, GFP_NOIO);
+	if (!hdr)
+		return -ENOMEM;
+
+	ret = kernel_read(dev->backing_file, hdr, LBD_QCOW2_HEADER_SIZE, &pos);
+	if (ret != LBD_QCOW2_HEADER_SIZE) {
+		kvfree(hdr);
+		return ret < 0 ? ret : -EIO;
+	}
+
+	new_l1_offset = lbd_qcow2_hdr_l1_table_offset(hdr);
+	new_l1_size = lbd_qcow2_hdr_l1_size(hdr);
+	q->alloc_offset = lbd_qcow2_hdr_alloc_offset(hdr);
+	q->free_list_head = lbd_qcow2_hdr_free_list(hdr);
+	kvfree(hdr);
+
+	new_l1 = kvmalloc_array(new_l1_size, sizeof(u64), GFP_NOIO);
+	if (!new_l1)
+		return -ENOMEM;
+
+	disk_l1 = kvmalloc_array(new_l1_size, sizeof(__be64), GFP_NOIO);
+	if (!disk_l1) {
+		kvfree(new_l1);
+		return -ENOMEM;
+	}
+
+	pos = new_l1_offset;
+	ret = kernel_read(dev->backing_file, disk_l1,
+			  new_l1_size * sizeof(__be64), &pos);
+	if (ret != new_l1_size * sizeof(__be64)) {
+		kvfree(disk_l1);
+		kvfree(new_l1);
+		return ret < 0 ? ret : -EIO;
+	}
+
+	for (i = 0; i < new_l1_size; i++)
+		new_l1[i] = be64_to_cpu(disk_l1[i]);
+	kvfree(disk_l1);
+
+	kvfree(q->l1_table);
+	q->l1_table = new_l1;
+	q->l1_size = new_l1_size;
+	q->l1_offset = new_l1_offset;
+
+	return 0;
+}
+
+/*
+ * Invalidate all caches (primary + base).
+ * Called with rwsem held for write.
+ */
+static void lbd_qcow2_invalidate_all_caches(struct lbd_qcow2 *q,
+					     struct lbd_qcow2_base *base)
+{
+	int i;
+
+	/* Primary cluster cache */
+	for (i = 0; i < LBD_QCOW2_CL_CACHE_SIZE; i++)
+		q->cl_cache[i].valid = false;
+
+	/* Primary L2 cache */
+	for (i = 0; i < LBD_QCOW2_L2_CACHE_SIZE; i++)
+		q->l2_cache[i].valid = false;
+
+	/* Base layer caches */
+	if (base && base->is_qcow2) {
+		for (i = 0; i < LBD_QCOW2_L2_CACHE_SIZE; i++)
+			base->l2_cache[i].valid = false;
+	}
+}
+
+int lbd_qcow2_swap_base(struct lbd_device *dev, const char *new_path)
+{
+	struct lbd_qcow2 *q = &dev->qcow2;
+	int ret;
+
+	down_write(&q->rwsem);
+
+	/* Flush all dirty L2 tables */
+	lbd_qcow2_flush_all_l2(dev);
+
+	/* Close old base */
+	if (dev->base) {
+		lbd_qcow2_base_destroy(dev->base);
+		dev->base = NULL;
+	}
+
+	/* Open new base */
+	ret = lbd_qcow2_base_init(dev, new_path);
+	if (ret) {
+		pr_warn("lbd%d: swap_base failed to open '%s': %d\n",
+			dev->index, new_path, ret);
+		up_write(&q->rwsem);
+		return ret;
+	}
+
+	/* Reload primary L1 table from disk */
+	ret = lbd_qcow2_reload_l1(q, dev);
+	if (ret) {
+		pr_warn("lbd%d: swap_base failed to reload L1: %d\n",
+			dev->index, ret);
+		up_write(&q->rwsem);
+		return ret;
+	}
+
+	/* Invalidate all cached data */
+	lbd_qcow2_invalidate_all_caches(q, dev->base);
+
+	/* Update stored path */
+	strscpy(dev->base_path, new_path, sizeof(dev->base_path));
+
+	up_write(&q->rwsem);
+
+	pr_info("lbd%d: base layer swapped to '%s'\n", dev->index, new_path);
 	return 0;
 }
 
@@ -1479,7 +1792,7 @@ int lbd_qcow2_base_init(struct lbd_device *dev, const char *path)
 		}
 
 		base->cluster_size = 1U << base->cluster_bits;
-		base->l2_entries = base->cluster_size / sizeof(u64);
+		base->l2_entries = (base->cluster_size - LBD_QCOW2_L2_TRAILER_SIZE) / sizeof(u64);
 		base->size = lbd_qcow2_hdr_virtual_size(hdr);
 		base->l1_offset = lbd_qcow2_hdr_l1_table_offset(hdr);
 		base->l1_size = lbd_qcow2_hdr_l1_size(hdr);

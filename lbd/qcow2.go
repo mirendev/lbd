@@ -6,16 +6,19 @@ package lbd
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 
 	"github.com/pierrec/lz4/v4"
 )
 
+var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
+
 // On-disk format constants matching the kernel lbd_qcow2.h definitions.
 const (
 	QCow2Magic      = 0x4C42444351573200 // "LBDQCW2\0"
-	QCow2Version    = 1
+	QCow2Version    = 2
 	QCow2HeaderSize = 4096
 	QCow2CompLZ4    = 1
 
@@ -27,7 +30,8 @@ const (
 	QCow2FreeEntryMin  = 16
 	QCow2OffFreeList   = 48
 
-	QCow2CompAlign = 4096
+	QCow2L2TrailerSize = 8 // 4 bytes reserved + 4 bytes CRC32C at end of L2 cluster
+	QCow2CompAlign     = 4096
 )
 
 // QCow2Header is the on-disk header for an LBD qcow2-lz4 image.
@@ -71,7 +75,7 @@ func CreateQCow2(path string, virtualSize uint64, clusterBits uint32) (*QCow2Ima
 	}
 
 	clusterSize := uint32(1) << clusterBits
-	l2Entries := clusterSize / 8
+	l2Entries := (clusterSize - QCow2L2TrailerSize) / 8
 
 	l1Size := uint32((virtualSize + uint64(l2Entries)*uint64(clusterSize) - 1) /
 		(uint64(l2Entries) * uint64(clusterSize)))
@@ -183,7 +187,7 @@ func OpenQCow2File(f *os.File) (*QCow2Image, error) {
 
 	clusterBits := binary.BigEndian.Uint32(hdrBuf[12:])
 	clusterSize := uint32(1) << clusterBits
-	l2Entries := clusterSize / 8
+	l2Entries := (clusterSize - QCow2L2TrailerSize) / 8
 
 	img := &QCow2Image{
 		f:            f,
@@ -474,6 +478,15 @@ func (img *QCow2Image) getL2(l1Idx uint32) ([]uint64, error) {
 		if _, err := img.f.ReadAt(buf, int64(img.L1Table[l1Idx])); err != nil {
 			return nil, fmt.Errorf("read L2 table: %w", err)
 		}
+
+		// Verify CRC32C trailer
+		storedCRC := binary.BigEndian.Uint32(buf[img.ClusterSize-4:])
+		calcCRC := crc32.Checksum(buf[:img.ClusterSize-4], crc32cTable)
+		if storedCRC != calcCRC {
+			return nil, fmt.Errorf("L2 CRC32C mismatch for l1[%d]: stored=0x%08x computed=0x%08x",
+				l1Idx, storedCRC, calcCRC)
+		}
+
 		for j := uint32(0); j < img.L2Entries; j++ {
 			l2[j] = binary.BigEndian.Uint64(buf[j*8:])
 		}
@@ -497,8 +510,10 @@ func (img *QCow2Image) allocateL2(l1Idx uint32) ([]uint64, error) {
 	img.L1Table[l1Idx] = img.AllocOffset
 	img.AllocOffset += uint64(img.ClusterSize)
 
-	// Write zeroed L2 table
+	// Write zeroed L2 table with CRC32C trailer
 	zeros := make([]byte, img.ClusterSize)
+	crc := crc32.Checksum(zeros[:img.ClusterSize-4], crc32cTable)
+	binary.BigEndian.PutUint32(zeros[img.ClusterSize-4:], crc)
 	if _, err := img.f.WriteAt(zeros, int64(img.L1Table[l1Idx])); err != nil {
 		return nil, fmt.Errorf("write L2 table: %w", err)
 	}
@@ -706,7 +721,7 @@ func (img *QCow2Image) writeCluster(clusterIdx uint64, data []byte) error {
 	return nil
 }
 
-// writeL2Table writes an L2 table to disk in big-endian format.
+// writeL2Table writes an L2 table to disk in big-endian format with CRC32C trailer.
 func (img *QCow2Image) writeL2Table(l1Idx uint32, l2 []uint64) error {
 	if img.L1Table[l1Idx] == 0 {
 		return nil // not allocated, skip
@@ -716,6 +731,10 @@ func (img *QCow2Image) writeL2Table(l1Idx uint32, l2 []uint64) error {
 	for j := uint32(0); j < img.L2Entries; j++ {
 		binary.BigEndian.PutUint64(buf[j*8:], l2[j])
 	}
+
+	// Compute CRC32C over [0, clusterSize-4) and store at end
+	crc := crc32.Checksum(buf[:img.ClusterSize-4], crc32cTable)
+	binary.BigEndian.PutUint32(buf[img.ClusterSize-4:], crc)
 
 	if _, err := img.f.WriteAt(buf, int64(img.L1Table[l1Idx])); err != nil {
 		return fmt.Errorf("write L2 table: %w", err)

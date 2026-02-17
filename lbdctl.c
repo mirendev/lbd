@@ -47,6 +47,12 @@
 /* Watch command keys (write path) */
 #define LBD_WATCH_KEY_CMD		1
 #define LBD_WATCH_KEY_DEV		2
+#define LBD_WATCH_KEY_PATH		3
+
+/* Miss event keys */
+#define LBD_MISS_KEY_TYPE		1
+#define LBD_MISS_KEY_DEV		2
+#define LBD_MISS_KEY_CLUSTER		3
 
 /* Event keys (read path) */
 #define LBD_EVENT_KEY_TYPE		1
@@ -111,6 +117,36 @@ static uint32_t crc32_calc(const void *buf, size_t len)
 	uint32_t crc = 0xFFFFFFFF;
 	for (size_t i = 0; i < len; i++)
 		crc = crc32_table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+	return crc ^ 0xFFFFFFFF;
+}
+
+/* ----------------------------------------------------------------
+ * CRC32C (Castagnoli polynomial 0x82F63B78, matches Linux crc32c())
+ * ---------------------------------------------------------------- */
+
+static uint32_t crc32c_table[256];
+static int crc32c_table_ready;
+
+static void crc32c_init(void)
+{
+	uint32_t poly = 0x82F63B78;
+	for (int i = 0; i < 256; i++) {
+		uint32_t c = i;
+		for (int j = 0; j < 8; j++)
+			c = (c >> 1) ^ (poly & (-(c & 1)));
+		crc32c_table[i] = c;
+	}
+	crc32c_table_ready = 1;
+}
+
+static uint32_t crc32c_calc(const void *buf, size_t len)
+{
+	if (!crc32c_table_ready)
+		crc32c_init();
+	const uint8_t *p = buf;
+	uint32_t crc = 0xFFFFFFFF;
+	for (size_t i = 0; i < len; i++)
+		crc = crc32c_table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
 	return crc ^ 0xFFFFFFFF;
 }
 
@@ -980,7 +1016,7 @@ static int cmd_create(int argc, char **argv)
 	}
 
 	cluster_size = 1U << cluster_bits;
-	l2_entries = cluster_size / 8;
+	l2_entries = (cluster_size - LBD_QCOW2_L2_TRAILER_SIZE) / 8;
 
 	/* Compute L1 size: one entry per L2 table needed */
 	l1_size = (virtual_size + (uint64_t)l2_entries * cluster_size - 1) /
@@ -1070,7 +1106,7 @@ static int cmd_convert(const char *flat_path, const char *qcow2_path)
 	uint64_t virtual_size;
 	uint32_t cluster_bits = 16;
 	uint32_t cluster_size = 1U << cluster_bits;
-	uint32_t l2_entries = cluster_size / 8;
+	uint32_t l2_entries = (cluster_size - LBD_QCOW2_L2_TRAILER_SIZE) / 8;
 	uint32_t l1_size;
 	uint64_t l1_table_offset, alloc_offset;
 	uint8_t hdr[LBD_QCOW2_HEADER_SIZE];
@@ -1253,6 +1289,13 @@ static int cmd_convert(const char *flat_path, const char *qcow2_path)
 		for (uint32_t j = 0; j < l2_entries; j++)
 			disk_l2[j] = htobe64_val(l2_tables[i][j]);
 
+		/* Compute and store CRC32C trailer */
+		{
+			uint8_t *raw = (uint8_t *)disk_l2;
+			uint32_t crc = crc32c_calc(raw, cluster_size - 4);
+			_qcow2_put32(raw, cluster_size - 4, crc);
+		}
+
 		n = pwrite(out_fd, disk_l2, cluster_size, l1_table[i]);
 		free(disk_l2);
 		if (n != cluster_size) {
@@ -1379,7 +1422,7 @@ static int cmd_extract(const char *qcow2_path, const char *flat_path)
 
 	cluster_bits = lbd_qcow2_hdr_cluster_bits(hdr);
 	cluster_size = 1U << cluster_bits;
-	l2_entries = cluster_size / 8;
+	l2_entries = (cluster_size - LBD_QCOW2_L2_TRAILER_SIZE) / 8;
 	virtual_size = lbd_qcow2_hdr_virtual_size(hdr);
 	l1_table_offset = lbd_qcow2_hdr_l1_table_offset(hdr);
 	l1_size = lbd_qcow2_hdr_l1_size(hdr);
@@ -1433,6 +1476,61 @@ static int cmd_extract(const char *qcow2_path, const char *flat_path)
 		return 1;
 	}
 
+	/* Read and verify all L2 tables */
+	uint64_t **ext_l2_tables = calloc(l1_size, sizeof(uint64_t *));
+	if (!ext_l2_tables) {
+		fprintf(stderr, "Out of memory\n");
+		close(in_fd);
+		close(out_fd);
+		return 1;
+	}
+	for (uint32_t i = 0; i < l1_size; i++) {
+		ext_l2_tables[i] = calloc(l2_entries, sizeof(uint64_t));
+		if (!ext_l2_tables[i]) {
+			fprintf(stderr, "Out of memory\n");
+			close(in_fd);
+			close(out_fd);
+			return 1;
+		}
+		if (l1_table[i] == 0)
+			continue;
+
+		uint8_t *disk_l2 = malloc(cluster_size);
+		if (!disk_l2) {
+			fprintf(stderr, "Out of memory\n");
+			close(in_fd);
+			close(out_fd);
+			return 1;
+		}
+		n = pread(in_fd, disk_l2, cluster_size, l1_table[i]);
+		if (n != (ssize_t)cluster_size) {
+			fprintf(stderr, "Failed to read L2 table %u\n", i);
+			free(disk_l2);
+			close(in_fd);
+			close(out_fd);
+			return 1;
+		}
+
+		/* Verify CRC32C */
+		{
+			uint32_t stored_crc = _qcow2_get32(disk_l2, cluster_size - 4);
+			uint32_t calc_crc = crc32c_calc(disk_l2, cluster_size - 4);
+			if (stored_crc != calc_crc) {
+				fprintf(stderr, "L2 CRC32C mismatch for l1[%u]: "
+					"stored=0x%08x computed=0x%08x\n",
+					i, stored_crc, calc_crc);
+				free(disk_l2);
+				close(in_fd);
+				close(out_fd);
+				return 1;
+			}
+		}
+
+		for (uint32_t j = 0; j < l2_entries; j++)
+			ext_l2_tables[i][j] = be64toh_val(((uint64_t *)disk_l2)[j]);
+		free(disk_l2);
+	}
+
 	/* Extract each cluster */
 	uint64_t total_clusters = (virtual_size + cluster_size - 1) / cluster_size;
 
@@ -1448,19 +1546,7 @@ static int cmd_extract(const char *qcow2_path, const char *flat_path)
 			continue;
 		}
 
-		/* Read L2 entry */
-		{
-			uint64_t disk_entry;
-			n = pread(in_fd, &disk_entry, sizeof(disk_entry),
-				  l1_table[l1_idx] + l2_idx * sizeof(uint64_t));
-			if (n != sizeof(disk_entry)) {
-				fprintf(stderr, "Failed to read L2 entry\n");
-				close(in_fd);
-				close(out_fd);
-				return 1;
-			}
-			l2_entry = be64toh_val(disk_entry);
-		}
+		l2_entry = ext_l2_tables[l1_idx][l2_idx];
 
 		if (l2_entry == 0) {
 			/* Unallocated cluster: zeros */
@@ -1533,6 +1619,9 @@ static int cmd_extract(const char *qcow2_path, const char *flat_path)
 
 	close(in_fd);
 	close(out_fd);
+	for (uint32_t i = 0; i < l1_size; i++)
+		free(ext_l2_tables[i]);
+	free(ext_l2_tables);
 	free(l1_table);
 	free(cluster_buf);
 	free(comp_buf);
@@ -1598,7 +1687,7 @@ static int cmd_compact(int argc, char **argv)
 
 	cluster_bits = lbd_qcow2_hdr_cluster_bits(hdr);
 	cluster_size = 1U << cluster_bits;
-	l2_entries = cluster_size / 8;
+	l2_entries = (cluster_size - LBD_QCOW2_L2_TRAILER_SIZE) / 8;
 	virtual_size = lbd_qcow2_hdr_virtual_size(hdr);
 	l1_table_offset = lbd_qcow2_hdr_l1_table_offset(hdr);
 	l1_size = lbd_qcow2_hdr_l1_size(hdr);
@@ -1660,6 +1749,22 @@ static int cmd_compact(int argc, char **argv)
 			close(in_fd);
 			return 1;
 		}
+
+		/* Verify CRC32C */
+		{
+			uint8_t *raw = (uint8_t *)disk_l2;
+			uint32_t stored_crc = _qcow2_get32(raw, cluster_size - 4);
+			uint32_t calc_crc = crc32c_calc(raw, cluster_size - 4);
+			if (stored_crc != calc_crc) {
+				fprintf(stderr, "L2 CRC32C mismatch for l1[%u]: "
+					"stored=0x%08x computed=0x%08x\n",
+					i, stored_crc, calc_crc);
+				free(disk_l2);
+				close(in_fd);
+				return 1;
+			}
+		}
+
 		for (uint32_t j = 0; j < l2_entries; j++)
 			l2_tables[i][j] = be64toh_val(disk_l2[j]);
 		free(disk_l2);
@@ -1812,6 +1917,13 @@ static int cmd_compact(int argc, char **argv)
 		memset(disk_l2, 0, cluster_size);
 		for (uint32_t j = 0; j < l2_entries; j++)
 			disk_l2[j] = htobe64_val(new_l2[i][j]);
+
+		/* Compute and store CRC32C trailer */
+		{
+			uint8_t *raw = (uint8_t *)disk_l2;
+			uint32_t crc = crc32c_calc(raw, cluster_size - 4);
+			_qcow2_put32(raw, cluster_size - 4, crc);
+		}
 
 		n = pwrite(out_fd, disk_l2, cluster_size, new_l1[i]);
 		free(disk_l2);
@@ -2237,6 +2349,393 @@ static int cmd_watch(int argc, char **argv)
 }
 
 /* ----------------------------------------------------------------
+ * Miss handler command
+ * ---------------------------------------------------------------- */
+
+/*
+ * Encode and write a manage_misses command.
+ */
+static int cbor_write_manage_misses_cmd(int fd, int dev_index)
+{
+	uint8_t buf[64];
+	size_t pos = 0;
+	const char *cmd_str = "manage_misses";
+	size_t cmd_len = strlen(cmd_str);
+	ssize_t n;
+
+	/* map(2) */
+	pos += cbor_write_head(buf + pos, 5, 2);
+
+	/* key 1: "manage_misses" */
+	pos += cbor_write_head(buf + pos, 0, LBD_WATCH_KEY_CMD);
+	pos += cbor_write_head(buf + pos, 3, cmd_len);
+	memcpy(buf + pos, cmd_str, cmd_len);
+	pos += cmd_len;
+
+	/* key 2: dev_index */
+	pos += cbor_write_head(buf + pos, 0, LBD_WATCH_KEY_DEV);
+	pos += cbor_write_head(buf + pos, 0, (uint64_t)dev_index);
+
+	n = write(fd, buf, pos);
+	if (n < 0) {
+		fprintf(stderr, "Failed to write manage_misses command: %s\n",
+			strerror(errno));
+		return -1;
+	}
+	if ((size_t)n != pos) {
+		fprintf(stderr, "Short write on manage_misses command\n");
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Encode and write a continue/retry command.
+ */
+static int cbor_write_miss_response(int fd, const char *action)
+{
+	uint8_t buf[64];
+	size_t pos = 0;
+	size_t cmd_len = strlen(action);
+	ssize_t n;
+
+	/* map(1) */
+	pos += cbor_write_head(buf + pos, 5, 1);
+
+	/* key 1: action */
+	pos += cbor_write_head(buf + pos, 0, LBD_WATCH_KEY_CMD);
+	pos += cbor_write_head(buf + pos, 3, cmd_len);
+	memcpy(buf + pos, action, cmd_len);
+	pos += cmd_len;
+
+	n = write(fd, buf, pos);
+	if (n < 0) {
+		fprintf(stderr, "Failed to write %s command: %s\n",
+			action, strerror(errno));
+		return -1;
+	}
+	if ((size_t)n != pos) {
+		fprintf(stderr, "Short write on %s command\n", action);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Decode a miss event from a CBOR buffer.
+ * Returns 0 on success, -1 on error.
+ */
+static int decode_miss_event(const uint8_t *buf, size_t len,
+			     int *dev_index, uint64_t *cluster)
+{
+	size_t pos = 0;
+	uint8_t ib, major, ai;
+	uint64_t map_count, key, val;
+	uint64_t slen;
+
+#define BUF_HEAD2(major_out, val_out) do {			\
+	if (pos >= len) return -1;				\
+	ib = buf[pos++];					\
+	*(major_out) = ib >> 5;					\
+	ai = ib & 0x1F;					\
+	if (ai < 24) { *(val_out) = ai; }			\
+	else if (ai == 24) {					\
+		if (pos + 1 > len) return -1;			\
+		*(val_out) = buf[pos++];			\
+	} else if (ai == 25) {					\
+		if (pos + 2 > len) return -1;			\
+		*(val_out) = ((uint64_t)buf[pos] << 8) | buf[pos+1]; \
+		pos += 2;					\
+	} else if (ai == 26) {					\
+		if (pos + 4 > len) return -1;			\
+		*(val_out) = ((uint64_t)buf[pos] << 24) |	\
+			     ((uint64_t)buf[pos+1] << 16) |	\
+			     ((uint64_t)buf[pos+2] << 8) |	\
+			     buf[pos+3];			\
+		pos += 4;					\
+	} else if (ai == 27) {					\
+		if (pos + 8 > len) return -1;			\
+		*(val_out) = ((uint64_t)buf[pos] << 56) |	\
+			     ((uint64_t)buf[pos+1] << 48) |	\
+			     ((uint64_t)buf[pos+2] << 40) |	\
+			     ((uint64_t)buf[pos+3] << 32) |	\
+			     ((uint64_t)buf[pos+4] << 24) |	\
+			     ((uint64_t)buf[pos+5] << 16) |	\
+			     ((uint64_t)buf[pos+6] << 8) |	\
+			     buf[pos+7];			\
+		pos += 8;					\
+	} else { return -1; }					\
+} while (0)
+
+	BUF_HEAD2(&major, &map_count);
+	if (major != 5)
+		return -1;
+
+	*dev_index = -1;
+	*cluster = 0;
+
+	for (uint64_t i = 0; i < map_count; i++) {
+		BUF_HEAD2(&major, &key);
+		if (major != 0)
+			return -1;
+
+		switch (key) {
+		case LBD_MISS_KEY_TYPE:
+			BUF_HEAD2(&major, &slen);
+			if (major != 3 || pos + slen > len)
+				return -1;
+			pos += slen;
+			break;
+		case LBD_MISS_KEY_DEV:
+			BUF_HEAD2(&major, &val);
+			if (major != 0)
+				return -1;
+			*dev_index = (int)val;
+			break;
+		case LBD_MISS_KEY_CLUSTER:
+			BUF_HEAD2(&major, &val);
+			if (major != 0)
+				return -1;
+			*cluster = val;
+			break;
+		default:
+			return -1;
+		}
+	}
+
+#undef BUF_HEAD2
+	return 0;
+}
+
+static int cmd_miss_handler(int argc, char **argv)
+{
+	int fd;
+	int dev_index = -1;
+	int json = 0;
+	struct pollfd pfd;
+	struct sigaction sa;
+	uint8_t rbuf[512];
+
+	for (int i = 0; i < argc; i++) {
+		if (strcmp(argv[i], "--dev") == 0) {
+			if (++i >= argc) {
+				fprintf(stderr, "--dev requires a value\n");
+				return 1;
+			}
+			dev_index = atoi(argv[i]);
+		} else if (strcmp(argv[i], "--json") == 0) {
+			json = 1;
+		} else {
+			fprintf(stderr, "Unexpected argument: %s\n", argv[i]);
+			return 1;
+		}
+	}
+
+	if (dev_index < 0) {
+		fprintf(stderr, "miss-handler requires --dev N\n");
+		return 1;
+	}
+
+	fd = open(LBD_CTL_PATH, O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "Cannot open %s: %s\n",
+			LBD_CTL_PATH, strerror(errno));
+		if (errno == ENOENT)
+			fprintf(stderr, "Is the lbd module loaded?\n");
+		return 1;
+	}
+
+	if (cbor_write_manage_misses_cmd(fd, dev_index) < 0) {
+		close(fd);
+		return 1;
+	}
+
+	if (!json)
+		fprintf(stderr, "Handling block misses for lbd%d...\n",
+			dev_index);
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = watch_sigint;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+
+	pfd.fd = fd;
+	pfd.events = POLLIN;
+
+	while (watch_running) {
+		int ret = poll(&pfd, 1, 1000);
+
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			fprintf(stderr, "poll error: %s\n", strerror(errno));
+			break;
+		}
+		if (ret == 0)
+			continue;
+
+		if (pfd.revents & POLLIN) {
+			ssize_t n = read(fd, rbuf, sizeof(rbuf));
+
+			if (n < 0) {
+				if (errno == EINTR)
+					continue;
+				fprintf(stderr, "read error: %s\n",
+					strerror(errno));
+				break;
+			}
+			if (n == 0)
+				break;
+
+			int miss_dev;
+			uint64_t miss_cluster;
+
+			if (decode_miss_event(rbuf, (size_t)n,
+					      &miss_dev, &miss_cluster) < 0) {
+				fprintf(stderr, "Failed to decode miss event\n");
+				continue;
+			}
+
+			if (json) {
+				printf("{\"type\":\"block_miss\","
+				       "\"dev\":%d,"
+				       "\"cluster\":%llu}\n",
+				       miss_dev,
+				       (unsigned long long)miss_cluster);
+			} else {
+				printf("lbd%d: block miss at cluster %llu\n",
+				       miss_dev,
+				       (unsigned long long)miss_cluster);
+			}
+			fflush(stdout);
+
+			/* Respond with continue */
+			if (cbor_write_miss_response(fd, "continue") < 0)
+				break;
+		}
+
+		if (pfd.revents & (POLLERR | POLLHUP))
+			break;
+	}
+
+	close(fd);
+	return 0;
+}
+
+/* ----------------------------------------------------------------
+ * Swap command
+ * ---------------------------------------------------------------- */
+
+/*
+ * Encode and write a swap command with a path.
+ */
+static int cbor_write_swap_cmd(int fd, const char *path)
+{
+	uint8_t buf[512];
+	size_t pos = 0;
+	const char *cmd_str = "swap";
+	size_t cmd_len = strlen(cmd_str);
+	size_t path_len = strlen(path);
+	ssize_t n;
+
+	/* map(2) */
+	pos += cbor_write_head(buf + pos, 5, 2);
+
+	/* key 1: "swap" */
+	pos += cbor_write_head(buf + pos, 0, LBD_WATCH_KEY_CMD);
+	pos += cbor_write_head(buf + pos, 3, cmd_len);
+	memcpy(buf + pos, cmd_str, cmd_len);
+	pos += cmd_len;
+
+	/* key 3: path */
+	pos += cbor_write_head(buf + pos, 0, LBD_WATCH_KEY_PATH);
+	pos += cbor_write_head(buf + pos, 3, path_len);
+	if (pos + path_len > sizeof(buf)) {
+		fprintf(stderr, "Path too long for CBOR buffer\n");
+		return -1;
+	}
+	memcpy(buf + pos, path, path_len);
+	pos += path_len;
+
+	n = write(fd, buf, pos);
+	if (n < 0) {
+		fprintf(stderr, "Failed to write swap command: %s\n",
+			strerror(errno));
+		return -1;
+	}
+	if ((size_t)n != pos) {
+		fprintf(stderr, "Short write on swap command\n");
+		return -1;
+	}
+	return 0;
+}
+
+static int cmd_swap(int argc, char **argv)
+{
+	int fd;
+	int dev_index = -1;
+	const char *path = NULL;
+	char resolved[PATH_MAX];
+
+	for (int i = 0; i < argc; i++) {
+		if (strcmp(argv[i], "--dev") == 0) {
+			if (++i >= argc) {
+				fprintf(stderr, "--dev requires a value\n");
+				return 1;
+			}
+			dev_index = atoi(argv[i]);
+		} else if (!path) {
+			path = argv[i];
+		} else {
+			fprintf(stderr, "Unexpected argument: %s\n", argv[i]);
+			return 1;
+		}
+	}
+
+	if (dev_index < 0) {
+		fprintf(stderr, "swap requires --dev N\n");
+		return 1;
+	}
+	if (!path) {
+		fprintf(stderr, "swap requires a path argument\n");
+		return 1;
+	}
+
+	if (!realpath(path, resolved)) {
+		fprintf(stderr, "Cannot resolve path '%s': %s\n",
+			path, strerror(errno));
+		return 1;
+	}
+
+	fd = open(LBD_CTL_PATH, O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "Cannot open %s: %s\n",
+			LBD_CTL_PATH, strerror(errno));
+		if (errno == ENOENT)
+			fprintf(stderr, "Is the lbd module loaded?\n");
+		return 1;
+	}
+
+	/* First register as miss handler for the device */
+	if (cbor_write_manage_misses_cmd(fd, dev_index) < 0) {
+		close(fd);
+		return 1;
+	}
+
+	/* Send swap command */
+	if (cbor_write_swap_cmd(fd, resolved) < 0) {
+		close(fd);
+		return 1;
+	}
+
+	printf("Swapped base layer for lbd%d to %s\n", dev_index, resolved);
+	close(fd);
+	return 0;
+}
+
+/* ----------------------------------------------------------------
  * Main
  * ---------------------------------------------------------------- */
 
@@ -2248,6 +2747,8 @@ static void usage(void)
 		"  lbdctl remove <N>                  Remove /dev/lbdN\n"
 		"  lbdctl list                        List all active lbd devices\n"
 		"  lbdctl watch [opts]                Watch for log rotation events\n"
+		"  lbdctl miss-handler [opts]         Handle block miss events\n"
+		"  lbdctl swap [opts] <path>          Swap base layer for a device\n"
 		"  lbdctl log [opts] <logfile>        Read and display a log file\n"
 		"  lbdctl create --size <S> <path>    Create empty qcow2-lz4 image\n"
 		"  lbdctl convert <flat> <qcow2>      Convert flat image to qcow2-lz4\n"
@@ -2263,6 +2764,13 @@ static void usage(void)
 		"Watch options:\n"
 		"  --dev <N>      Only watch device N (default: all)\n"
 		"  --json         Output events as JSON\n"
+		"\n"
+		"Miss handler options:\n"
+		"  --dev <N>      Device to handle misses for (required)\n"
+		"  --json         Output events as JSON\n"
+		"\n"
+		"Swap options:\n"
+		"  --dev <N>      Device to swap base for (required)\n"
 		"\n"
 		"Create options:\n"
 		"  --size <bytes>           Virtual device size (supports K/M/G/T suffixes)\n"
@@ -2302,6 +2810,14 @@ int main(int argc, char **argv)
 
 	if (strcmp(argv[1], "watch") == 0) {
 		return cmd_watch(argc - 2, argv + 2);
+	}
+
+	if (strcmp(argv[1], "miss-handler") == 0) {
+		return cmd_miss_handler(argc - 2, argv + 2);
+	}
+
+	if (strcmp(argv[1], "swap") == 0) {
+		return cmd_swap(argc - 2, argv + 2);
 	}
 
 	if (strcmp(argv[1], "create") == 0) {

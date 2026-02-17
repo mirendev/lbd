@@ -477,6 +477,57 @@ func TestQCow2TrimFreesExtent(t *testing.T) {
 	require.NoError(t, img.Close())
 }
 
+func TestQCow2L2CRC32CCorruptionDetected(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.qcow2")
+
+	// Create image and write some data to force L2 table allocation
+	img, err := CreateQCow2(path, 1024*1024, 16)
+	require.NoError(t, err)
+
+	data := bytes.Repeat([]byte("X"), 4096)
+	_, err = img.WriteAt(data, 0)
+	require.NoError(t, err)
+
+	require.NoError(t, img.Close())
+
+	// Verify we can read it back cleanly first
+	img2, err := OpenQCow2ReadOnly(path)
+	require.NoError(t, err)
+	readBuf := make([]byte, 4096)
+	_, err = img2.ReadAt(readBuf, 0)
+	require.NoError(t, err)
+	assert.Equal(t, data, readBuf)
+	require.NoError(t, img2.Close())
+
+	// Now corrupt a byte in the L2 table on disk.
+	// The L2 table is at the offset stored in L1[0].
+	img3, err := OpenQCow2(path)
+	require.NoError(t, err)
+	l2Offset := img3.L1Table[0]
+	require.NotEqual(t, uint64(0), l2Offset, "L2 table should be allocated")
+	img3.Close()
+
+	// Corrupt a byte in the L2 table entries area (not the CRC itself)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	var corruptBuf [1]byte
+	_, err = f.ReadAt(corruptBuf[:], int64(l2Offset)+4)
+	require.NoError(t, err)
+	corruptBuf[0] ^= 0xFF // flip all bits
+	_, err = f.WriteAt(corruptBuf[:], int64(l2Offset)+4)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	// Reopen and try to read — should get CRC error
+	img4, err := OpenQCow2ReadOnly(path)
+	require.NoError(t, err)
+	defer img4.Close()
+
+	_, err = img4.ReadAt(readBuf, 0)
+	require.Error(t, err, "expected CRC32C mismatch error after corruption")
+	assert.Contains(t, err.Error(), "CRC32C mismatch")
+}
+
 func TestQCow2CompatibleWithLbdctl(t *testing.T) {
 	// Create a flat file, use the Go qcow2 writer to create an image,
 	// then verify the Go reader can read it back correctly.

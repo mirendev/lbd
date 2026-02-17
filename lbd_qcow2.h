@@ -60,7 +60,7 @@ struct lbd_qcow2_base {
 struct lbd_qcow2 {
 	u32     cluster_bits;
 	u32     cluster_size;		/* 1 << cluster_bits */
-	u32     l2_entries;		/* cluster_size / 8 */
+	u32     l2_entries;		/* (cluster_size - L2_TRAILER_SIZE) / 8 */
 	u64     virtual_size;
 
 	u64     *l1_table;		/* host-endian, always resident */
@@ -96,5 +96,6 @@ int  lbd_qcow2_discard(struct lbd_device *dev, struct request *rq);
 /* Base layer (thin snapshot) */
 int  lbd_qcow2_base_init(struct lbd_device *dev, const char *path);
 void lbd_qcow2_base_destroy(struct lbd_qcow2_base *base);
+int  lbd_qcow2_swap_base(struct lbd_device *dev, const char *new_path);
 
 #endif /* _LBD_QCOW2_H */
