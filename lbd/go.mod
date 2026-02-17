@@ -1,4 +1,4 @@
-module github.com/evanphx/lbd/lbdlog
+module github.com/evanphx/lbd/lbd
 
 go 1.25.1
 

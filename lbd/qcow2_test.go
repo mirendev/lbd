@@ -1,4 +1,4 @@
-package lbdlog
+package lbd
 
 import (
 	"bytes"

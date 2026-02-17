@@ -1,8 +1,8 @@
-// Package lbdlog reads LBD CBOR log files (format version 2).
+// Package lbd reads LBD CBOR log files (format version 2).
 //
 // Log files are CBOR sequences (RFC 8742): a header map followed by
 // zero or more entry maps concatenated without framing.
-package lbdlog
+package lbd
 
 import (
 	"fmt"

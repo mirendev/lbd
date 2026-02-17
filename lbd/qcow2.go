@@ -1,7 +1,7 @@
-// Package lbdlog provides qcow2-lz4 image support for reading and writing
+// Package lbd provides qcow2-lz4 image support for reading and writing
 // LBD compressed backing store images.
 
-package lbdlog
+package lbd
 
 import (
 	"encoding/binary"
