@@ -1,0 +1,9 @@
+name = "pg"
+base_dir = "./var/lbd"
+size = "1G"
+
+[s3]
+bucket = "logs"
+prefix = "lbd-logs"
+endpoint = "http://localhost:9000"
+region = "us-east-1"

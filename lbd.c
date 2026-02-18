@@ -1487,7 +1487,6 @@ static void lbd_notify_watchers(struct lbd_device *dev)
 {
 	struct lbd_watcher_event ev;
 	struct lbd_watcher *w;
-
 	ev.dev_index = dev->index;
 	ev.log_seq = dev->log_seq;
 	ev.device_size = dev->size;

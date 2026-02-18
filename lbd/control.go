@@ -3,6 +3,7 @@ package lbd
 import (
 	"fmt"
 	"os"
+	"syscall"
 
 	"github.com/fxamacker/cbor/v2"
 )
@@ -59,10 +60,19 @@ type ControlConn struct {
 }
 
 // OpenControl opens /dev/lbd-control for reading and writing.
+// We use syscall.Open to keep the fd in blocking mode. Go's os.OpenFile
+// sets O_NONBLOCK and relies on the runtime poller (epoll), but misc
+// device fds may not be registered with Go's netpoller, causing EAGAIN
+// to surface as an error instead of being retried.
 func OpenControl() (*ControlConn, error) {
-	f, err := os.OpenFile("/dev/lbd-control", os.O_RDWR, 0)
+	fd, err := syscall.Open("/dev/lbd-control", syscall.O_RDWR|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open /dev/lbd-control: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), "/dev/lbd-control")
+	if f == nil {
+		syscall.Close(fd)
+		return nil, fmt.Errorf("os.NewFile failed")
 	}
 	return NewControlConn(f)
 }
