@@ -152,22 +152,11 @@ func ScanDevice(cfg ScanConfig) (*ScanResult, error) {
 	holes := BuildHoleMap(dev, deviceSize)
 
 	// Open/create SQLite DB
-	db, err := sql.Open("sqlite", cfg.DBPath)
+	db, err := OpenDB(cfg.DBPath)
 	if err != nil {
-		return nil, fmt.Errorf("opening database: %w", err)
+		return nil, err
 	}
 	defer db.Close()
-
-	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		return nil, fmt.Errorf("setting journal mode: %w", err)
-	}
-
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS run_hashes (
-		run_offset INTEGER PRIMARY KEY,
-		sha256     TEXT NOT NULL
-	)`); err != nil {
-		return nil, fmt.Errorf("creating table: %w", err)
-	}
 
 	// Compute total runs
 	totalRuns := deviceSize / ScanRunSize

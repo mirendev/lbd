@@ -1,6 +1,7 @@
 package lbd
 
 import (
+	"context"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -130,9 +131,10 @@ func DiscoverLogFiles(dir string) ([]string, error) {
 
 // GCConfig holds configuration for a GC run.
 type GCConfig struct {
-	LogDir    string  // directory containing log segment files
-	Threshold float64 // utilization threshold (0.0-1.0); segments below this are retired
-	DryRun    bool    // if true, analyze only without retiring
+	LogDir    string   // directory containing log segment files (used when Store is nil)
+	Store     LogStore // if non-nil, used instead of LogDir for all I/O
+	Threshold int // utilization threshold as a percentage (0-100); segments below this are retired
+	DryRun    bool     // if true, analyze only without retiring
 }
 
 // SegmentStats holds per-segment liveness statistics from GC analysis.
@@ -157,7 +159,7 @@ func (s *SegmentStats) Utilization() float64 {
 type GCResult struct {
 	Stats          []SegmentStats
 	RetireIndexes  []int    // indexes into Stats of segments below threshold
-	Threshold      float64  // threshold used
+	Threshold      int      // threshold used (percentage)
 	RetiredCount   int      // number of segments actually retired (0 if dry run)
 	CopiedEntries  int      // entries copied to new segment
 	CopiedBytes    uint64   // bytes copied
@@ -165,75 +167,98 @@ type GCResult struct {
 	DeletedPaths   []string // paths of deleted segment files
 }
 
-// entryMeta holds metadata for a single log entry during GC analysis.
-type entryMeta struct {
-	segIndex   int
-	entryIndex int
-	block      uint64
-	numBlocks  uint64
-	isWrite    bool
-	dataLen    uint32
-	liveRanges []Interval
-}
-
-type entryKey struct {
-	segIndex, entryIndex int
-}
-
 // RunGC analyzes log segments for dead entries and optionally retires
 // segments with utilization below the configured threshold.
-func RunGC(cfg GCConfig) (*GCResult, error) {
-	if cfg.LogDir == "" {
-		return nil, fmt.Errorf("log directory is required")
+//
+// If a LiveMap exists in the store, only new logs (those with labels after
+// the map's last label) are processed. Otherwise all logs are analyzed.
+// The updated LiveMap is saved after every run (including dry runs).
+func RunGC(ctx context.Context, cfg GCConfig) (*GCResult, error) {
+	store := cfg.Store
+	if store == nil {
+		if cfg.LogDir == "" {
+			return nil, fmt.Errorf("log directory or store is required")
+		}
+		store = &DirLogStore{Dir: cfg.LogDir}
 	}
 
 	threshold := cfg.Threshold
-	if threshold == 0 {
-		threshold = 0.5
-	}
 
-	logFiles, err := DiscoverLogFiles(cfg.LogDir)
+	logFiles, err := store.List(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if len(logFiles) == 0 {
-		return nil, fmt.Errorf("no .log files found in %s", cfg.LogDir)
+		return nil, fmt.Errorf("no .log files found")
 	}
 
-	// --- Pass 1: Analyze ---
+	// Load or create LiveMap.
+	lm, err := LoadLiveMap(ctx, store)
+	if err != nil {
+		return nil, fmt.Errorf("loading live map: %w", err)
+	}
 
-	var allMeta []entryMeta
-	stats := make([]SegmentStats, len(logFiles))
+	var logsToProcess []string
+	if lm != nil {
+		// Incremental: only process logs newer than the last saved label.
+		for _, logID := range logFiles {
+			label := LabelFromLogPath(logID)
+			if label > lm.LastLabel {
+				logsToProcess = append(logsToProcess, logID)
+			}
+		}
+		// Clean up segments that no longer exist in the store.
+		existingLogs := make(map[string]bool, len(logFiles))
+		for _, logID := range logFiles {
+			existingLogs[logID] = true
+		}
+		for segID := range lm.Segments {
+			if !existingLogs[segID] {
+				lm.RemoveSegment(segID)
+			}
+		}
+	} else {
+		logsToProcess = logFiles
+	}
 
-	var firstHeader Header
+	// Read first header for device metadata (needed for retirement output).
+	rc, err := store.Open(ctx, logFiles[0])
+	if err != nil {
+		return nil, fmt.Errorf("opening %s: %w", logFiles[0], err)
+	}
+	firstRd, err := NewReader(rc)
+	if err != nil {
+		rc.Close()
+		return nil, fmt.Errorf("reading header from %s: %w", logFiles[0], err)
+	}
+	firstHeader := firstRd.Header
+	rc.Close()
 
-	for si, logPath := range logFiles {
-		stats[si].Path = logPath
+	if lm == nil {
+		lm = NewLiveMap(firstHeader.BlockSize)
+	}
 
-		f, err := os.Open(logPath)
+	// Process new logs through the LiveMap.
+	for _, logID := range logsToProcess {
+		rc, err := store.Open(ctx, logID)
 		if err != nil {
-			return nil, fmt.Errorf("opening %s: %w", logPath, err)
+			return nil, fmt.Errorf("opening %s: %w", logID, err)
 		}
 
-		rd, err := NewReader(f)
+		rd, err := NewReader(rc)
 		if err != nil {
-			f.Close()
-			return nil, fmt.Errorf("reading header from %s: %w", logPath, err)
+			rc.Close()
+			return nil, fmt.Errorf("reading header from %s: %w", logID, err)
 		}
 
-		if si == 0 {
-			firstHeader = rd.Header
-		}
-
-		ei := 0
 		for {
 			e, err := rd.Next()
 			if err == io.EOF {
 				break
 			}
 			if err != nil {
-				f.Close()
-				return nil, fmt.Errorf("reading entry from %s: %w", logPath, err)
+				rc.Close()
+				return nil, fmt.Errorf("reading entry from %s: %w", logID, err)
 			}
 
 			numBlocks := uint64(e.Length) / uint64(rd.Header.BlockSize)
@@ -241,212 +266,243 @@ func RunGC(cfg GCConfig) (*GCResult, error) {
 				numBlocks = 1
 			}
 
-			m := entryMeta{
-				segIndex:   si,
-				entryIndex: ei,
-				block:      e.Block,
-				numBlocks:  numBlocks,
-				isWrite:    e.IsWrite(),
-				dataLen:    e.Length,
-			}
-			allMeta = append(allMeta, m)
-
 			if e.IsWrite() {
-				stats[si].TotalWriteBytes += uint64(e.Length)
-			}
-			stats[si].TotalEntries++
-
-			ei++
-		}
-
-		f.Close()
-	}
-
-	// Process entries in reverse order (newest first) to determine liveness.
-	var covered BlockSet
-	blockSize := firstHeader.BlockSize
-	for i := len(allMeta) - 1; i >= 0; i-- {
-		m := &allMeta[i]
-		lo := m.block
-		hi := lo + m.numBlocks
-		liveRanges := covered.Uncovered(lo, hi)
-		m.liveRanges = liveRanges
-		if len(liveRanges) > 0 {
-			covered.Add(lo, hi)
-		}
-	}
-
-	// Accumulate per-segment live stats.
-	for i := range allMeta {
-		m := &allMeta[i]
-		if len(m.liveRanges) > 0 {
-			stats[m.segIndex].LiveEntries++
-			if m.isWrite {
-				for _, r := range m.liveRanges {
-					stats[m.segIndex].LiveWriteBytes += (r.Hi - r.Lo) * uint64(blockSize)
-				}
+				lm.ApplyWrite(e.Block, numBlocks, logID)
+				lm.AddSegmentEntry(logID, true, uint64(e.Length))
+			} else if e.IsTrim() {
+				lm.ApplyTrim(e.Block, numBlocks, logID)
+				lm.AddSegmentEntry(logID, false, 0)
 			}
 		}
+
+		lm.LastLabel = LabelFromLogPath(logID)
+		rc.Close()
 	}
+
+	// Compute stats from the LiveMap.
+	stats := lm.ComputeStats()
 
 	result := &GCResult{
 		Stats:     stats,
 		Threshold: threshold,
 	}
 
-	// Identify segments to retire.
+	// Identify segments to retire. When there are multiple segments, the
+	// most recent one (last in sorted order) is excluded from retirement
+	// because it may have been created by a previous GC run and retiring
+	// it would cause an endless retire-recreate cycle.
+	thresholdFrac := float64(threshold) / 100.0
+	lastIdx := len(stats) - 1
 	for si, s := range stats {
+		if si == lastIdx && len(stats) > 1 {
+			continue
+		}
 		util := s.Utilization()
-		if util < threshold && s.TotalWriteBytes > 0 {
+		if util < thresholdFrac && s.TotalWriteBytes > 0 {
 			result.RetireIndexes = append(result.RetireIndexes, si)
 		}
 	}
 
 	if len(result.RetireIndexes) == 0 || cfg.DryRun {
+		if err := SaveLiveMap(ctx, store, lm); err != nil {
+			return nil, fmt.Errorf("saving live map: %w", err)
+		}
 		return result, nil
 	}
 
-	// --- Pass 2: Retire ---
+	// --- Retire ---
 
-	// Build set of live entries in retired segments.
-	liveSet := make(map[entryKey][]Interval)
-	for i := range allMeta {
-		m := &allMeta[i]
-		if len(m.liveRanges) == 0 {
-			continue
-		}
-		for _, ri := range result.RetireIndexes {
-			if m.segIndex == ri {
-				liveSet[entryKey{m.segIndex, m.entryIndex}] = m.liveRanges
-				break
-			}
+	// Check whether any retired segments have live extents.
+	hasLive := false
+	for _, ri := range result.RetireIndexes {
+		if len(lm.SegmentLiveExtents(stats[ri].Path)) > 0 {
+			hasLive = true
+			break
 		}
 	}
 
-	// If no live entries to copy, just delete the retired segments.
-	if len(liveSet) == 0 {
+	if !hasLive {
+		// No live data — just delete retired segments.
 		for _, ri := range result.RetireIndexes {
-			if err := os.Remove(stats[ri].Path); err != nil {
+			if err := store.Delete(ctx, stats[ri].Path); err != nil {
 				return nil, fmt.Errorf("removing %s: %w", stats[ri].Path, err)
 			}
 			result.DeletedPaths = append(result.DeletedPaths, stats[ri].Path)
+			lm.RemoveSegment(stats[ri].Path)
 		}
 		result.RetiredCount = len(result.RetireIndexes)
+		if err := SaveLiveMap(ctx, store, lm); err != nil {
+			return nil, fmt.Errorf("saving live map: %w", err)
+		}
 		return result, nil
 	}
 
+	// Create new compacted segment from live entries in retired segments.
 	label := TAI64NLabel()
-	tmpPath := filepath.Join(cfg.LogDir, "disk."+label+".log.tmp")
-	finalPath := filepath.Join(cfg.LogDir, "disk."+label+".log")
+	blockSize := firstHeader.BlockSize
 
-	outFile, err := os.Create(tmpPath)
+	tmpFile, err := os.CreateTemp("", "lbd-gc-*.log.tmp")
 	if err != nil {
-		return nil, fmt.Errorf("creating output file: %w", err)
+		return nil, fmt.Errorf("creating temp file: %w", err)
 	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
 
 	outHdr := Header{
 		Version:      firstHeader.Version,
-		BlockSize:    firstHeader.BlockSize,
+		BlockSize:    blockSize,
 		SegmentLabel: label,
 		DeviceSize:   firstHeader.DeviceSize,
 		BackingPath:  firstHeader.BackingPath,
 	}
 
-	wr, err := NewWriter(outFile, outHdr)
+	wr, err := NewWriter(tmpFile, outHdr)
 	if err != nil {
-		outFile.Close()
-		os.Remove(tmpPath)
+		tmpFile.Close()
 		return nil, fmt.Errorf("writing output header: %w", err)
 	}
 
 	seq := uint64(0)
 
 	for _, ri := range result.RetireIndexes {
-		f, err := os.Open(stats[ri].Path)
-		if err != nil {
-			outFile.Close()
-			os.Remove(tmpPath)
-			return nil, fmt.Errorf("opening %s: %w", stats[ri].Path, err)
+		segPath := stats[ri].Path
+		segExtents := lm.SegmentLiveExtents(segPath)
+		if len(segExtents) == 0 {
+			continue
 		}
 
-		rd, err := NewReader(f)
+		// Read segment entries and determine within-segment liveness
+		// via reverse BlockSet analysis, then intersect with the LiveMap
+		// extents to account for cross-segment supersession.
+		entries, numBlocksList, err := readSegmentEntries(ctx, store, segPath, blockSize)
 		if err != nil {
-			f.Close()
-			outFile.Close()
-			os.Remove(tmpPath)
-			return nil, fmt.Errorf("reading header from %s: %w", stats[ri].Path, err)
+			tmpFile.Close()
+			return nil, err
 		}
 
-		ei := 0
-		for {
-			e, err := rd.Next()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				f.Close()
-				outFile.Close()
-				os.Remove(tmpPath)
-				return nil, fmt.Errorf("reading entry from %s: %w", stats[ri].Path, err)
-			}
+		entryLiveRanges := computeRetireLiveness(entries, numBlocksList, segExtents)
 
-			if ranges, ok := liveSet[entryKey{ri, ei}]; ok {
-				for _, r := range ranges {
-					splitEntry := &Entry{
-						Op:          e.Op,
-						TimestampNS: uint64(time.Now().UnixNano()),
-						Sequence:    seq,
-						Block:       r.Lo,
-					}
-					seq++
-					if e.IsWrite() {
-						dataStart := (r.Lo - e.Block) * uint64(blockSize)
-						dataEnd := (r.Hi - e.Block) * uint64(blockSize)
-						slice := e.Data[dataStart:dataEnd]
-						splitEntry.Length = uint32(len(slice))
-						splitEntry.Checksum = crc32.ChecksumIEEE(slice)
-						splitEntry.Data = slice
-					} else {
-						splitEntry.Length = uint32((r.Hi - r.Lo) * uint64(blockSize))
-					}
-					if err := wr.WriteEntry(splitEntry); err != nil {
-						f.Close()
-						outFile.Close()
-						os.Remove(tmpPath)
-						return nil, fmt.Errorf("writing entry: %w", err)
-					}
-					result.CopiedEntries++
-					if e.IsWrite() {
-						result.CopiedBytes += uint64(splitEntry.Length)
-					}
+		for i, e := range entries {
+			for _, r := range entryLiveRanges[i] {
+				splitEntry := &Entry{
+					Op:          e.Op,
+					TimestampNS: uint64(time.Now().UnixNano()),
+					Sequence:    seq,
+					Block:       r.Lo,
+				}
+				seq++
+				if e.IsWrite() {
+					dataStart := (r.Lo - e.Block) * uint64(blockSize)
+					dataEnd := (r.Hi - e.Block) * uint64(blockSize)
+					slice := e.Data[dataStart:dataEnd]
+					splitEntry.Length = uint32(len(slice))
+					splitEntry.Checksum = crc32.ChecksumIEEE(slice)
+					splitEntry.Data = slice
+				} else {
+					splitEntry.Length = uint32((r.Hi - r.Lo) * uint64(blockSize))
+				}
+				if err := wr.WriteEntry(splitEntry); err != nil {
+					tmpFile.Close()
+					return nil, fmt.Errorf("writing entry: %w", err)
+				}
+				result.CopiedEntries++
+				if e.IsWrite() {
+					result.CopiedBytes += uint64(splitEntry.Length)
 				}
 			}
-
-			ei++
 		}
-
-		f.Close()
 	}
 
-	if err := outFile.Close(); err != nil {
-		os.Remove(tmpPath)
+	if err := tmpFile.Close(); err != nil {
 		return nil, fmt.Errorf("closing output file: %w", err)
 	}
 
-	if err := os.Rename(tmpPath, finalPath); err != nil {
-		return nil, fmt.Errorf("renaming temp file: %w", err)
+	finalID := store.LogPath(label)
+	if err := store.Put(ctx, finalID, tmpPath); err != nil {
+		return nil, fmt.Errorf("storing new segment: %w", err)
 	}
 
-	result.NewSegmentPath = finalPath
+	result.NewSegmentPath = finalID
 
-	// Delete retired segments.
+	// Delete retired segments and update LiveMap.
 	for _, ri := range result.RetireIndexes {
-		if err := os.Remove(stats[ri].Path); err != nil {
+		if err := store.Delete(ctx, stats[ri].Path); err != nil {
 			return nil, fmt.Errorf("removing %s: %w", stats[ri].Path, err)
 		}
 		result.DeletedPaths = append(result.DeletedPaths, stats[ri].Path)
+		lm.ReattributeSegment(stats[ri].Path, finalID)
+		delete(lm.Segments, stats[ri].Path)
+	}
+	lm.Segments[finalID] = &SegInfo{
+		TotalEntries:    result.CopiedEntries,
+		TotalWriteBytes: result.CopiedBytes,
 	}
 
 	result.RetiredCount = len(result.RetireIndexes)
+
+	if err := SaveLiveMap(ctx, store, lm); err != nil {
+		return nil, fmt.Errorf("saving live map: %w", err)
+	}
+
 	return result, nil
+}
+
+// readSegmentEntries reads all entries from a segment.
+func readSegmentEntries(ctx context.Context, store LogStore, segPath string, blockSize uint32) ([]*Entry, []uint64, error) {
+	rc, err := store.Open(ctx, segPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("opening %s: %w", segPath, err)
+	}
+	defer rc.Close()
+
+	rd, err := NewReader(rc)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading header from %s: %w", segPath, err)
+	}
+
+	var entries []*Entry
+	var numBlocksList []uint64
+	for {
+		e, err := rd.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("reading entry from %s: %w", segPath, err)
+		}
+		numBlocks := uint64(e.Length) / uint64(blockSize)
+		if numBlocks == 0 {
+			numBlocks = 1
+		}
+		entries = append(entries, e)
+		numBlocksList = append(numBlocksList, numBlocks)
+	}
+	return entries, numBlocksList, nil
+}
+
+// computeRetireLiveness determines per-entry live ranges for a retired segment.
+// It uses reverse BlockSet analysis for within-segment liveness, then
+// intersects with the LiveMap's segment extents for cross-segment filtering.
+func computeRetireLiveness(entries []*Entry, numBlocksList []uint64, segExtents []LiveExtent) [][]Interval {
+	// Reverse analysis for within-segment liveness.
+	var covered BlockSet
+	withinLive := make([][]Interval, len(entries))
+	for i := len(entries) - 1; i >= 0; i-- {
+		lo := entries[i].Block
+		hi := lo + numBlocksList[i]
+		uncovered := covered.Uncovered(lo, hi)
+		withinLive[i] = uncovered
+		if len(uncovered) > 0 {
+			covered.Add(lo, hi)
+		}
+	}
+
+	// Intersect within-segment liveness with LiveMap segment extents.
+	result := make([][]Interval, len(entries))
+	for i := range entries {
+		for _, r := range withinLive[i] {
+			result[i] = append(result[i], intersectRange(segExtents, r.Lo, r.Hi)...)
+		}
+	}
+	return result
 }

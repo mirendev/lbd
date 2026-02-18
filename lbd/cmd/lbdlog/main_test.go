@@ -115,7 +115,7 @@ func TestGCNoShadowing(t *testing.T) {
 		makeWriteEntry(10, 1, 0, 'B'),
 	})
 
-	err := runGC(&gcArgs{LogDir: dir, Threshold: 0.5})
+	err := runGC(&gcArgs{LogDir: dir, Threshold: 50})
 	require.NoError(t, err)
 
 	files := logFilesInDir(t, dir)
@@ -132,7 +132,7 @@ func TestGCFullShadow(t *testing.T) {
 		makeWriteEntry(0, 1, 0, 'B'),
 	})
 
-	err := runGC(&gcArgs{LogDir: dir, Threshold: 0.5})
+	err := runGC(&gcArgs{LogDir: dir, Threshold: 50})
 	require.NoError(t, err)
 
 	files := logFilesInDir(t, dir)
@@ -155,7 +155,7 @@ func TestGCPartialShadow(t *testing.T) {
 		makeWriteEntry(0, 1, 0, 'B'),
 	})
 
-	err := runGC(&gcArgs{LogDir: dir, Threshold: 0.6})
+	err := runGC(&gcArgs{LogDir: dir, Threshold: 60})
 	require.NoError(t, err)
 
 	files := logFilesInDir(t, dir)
@@ -192,7 +192,7 @@ func TestGCDryRunDoesNotModify(t *testing.T) {
 
 	filesBefore := logFilesInDir(t, dir)
 
-	err := runGC(&gcArgs{LogDir: dir, Threshold: 0.5, DryRun: true})
+	err := runGC(&gcArgs{LogDir: dir, Threshold: 50, DryRun: true})
 	require.NoError(t, err)
 
 	filesAfter := logFilesInDir(t, dir)
@@ -209,7 +209,7 @@ func TestGCTrimShadowsWrite(t *testing.T) {
 		makeTrimEntry(0, 1, 0),
 	})
 
-	err := runGC(&gcArgs{LogDir: dir, Threshold: 0.5})
+	err := runGC(&gcArgs{LogDir: dir, Threshold: 50})
 	require.NoError(t, err)
 
 	files := logFilesInDir(t, dir)
@@ -224,7 +224,7 @@ func TestGCTrimOnlySegmentKept(t *testing.T) {
 		makeTrimEntry(0, 10, 0),
 	})
 
-	err := runGC(&gcArgs{LogDir: dir, Threshold: 0.5})
+	err := runGC(&gcArgs{LogDir: dir, Threshold: 50})
 	require.NoError(t, err)
 
 	files := logFilesInDir(t, dir)
@@ -243,7 +243,7 @@ func TestGCMultiBlockShadowing(t *testing.T) {
 		makeWriteEntry(2, 2, 1, 'C'),
 	})
 
-	err := runGC(&gcArgs{LogDir: dir, Threshold: 0.5})
+	err := runGC(&gcArgs{LogDir: dir, Threshold: 50})
 	require.NoError(t, err)
 
 	files := logFilesInDir(t, dir)
@@ -259,7 +259,7 @@ func TestGCWithinSegmentShadowing(t *testing.T) {
 		makeWriteEntry(0, 1, 1, 'B'),
 	})
 
-	err := runGC(&gcArgs{LogDir: dir, Threshold: 0.5})
+	err := runGC(&gcArgs{LogDir: dir, Threshold: 50})
 	require.NoError(t, err)
 
 	files := logFilesInDir(t, dir)
@@ -275,7 +275,7 @@ func TestGCWithinSegmentShadowingRetired(t *testing.T) {
 		makeWriteEntry(0, 1, 1, 'B'),
 	})
 
-	err := runGC(&gcArgs{LogDir: dir, Threshold: 0.6})
+	err := runGC(&gcArgs{LogDir: dir, Threshold: 60})
 	require.NoError(t, err)
 
 	files := logFilesInDir(t, dir)
@@ -298,7 +298,7 @@ func TestGCHighUtilizationNotRetired(t *testing.T) {
 		makeWriteEntry(2, 1, 2, 'C'),
 	})
 
-	err := runGC(&gcArgs{LogDir: dir, Threshold: 0.99})
+	err := runGC(&gcArgs{LogDir: dir, Threshold: 99})
 	require.NoError(t, err)
 
 	files := logFilesInDir(t, dir)
@@ -326,7 +326,7 @@ func TestGCPreservesEntryData(t *testing.T) {
 		makeWriteEntry(0, 1, 0, 'B'),
 	})
 
-	err := runGC(&gcArgs{LogDir: dir, Threshold: 0.6})
+	err := runGC(&gcArgs{LogDir: dir, Threshold: 60})
 	require.NoError(t, err)
 
 	files := logFilesInDir(t, dir)
@@ -361,7 +361,7 @@ func TestGCThreeSegmentsCascadingShadow(t *testing.T) {
 		makeWriteEntry(0, 1, 0, 'D'),
 	})
 
-	err := runGC(&gcArgs{LogDir: dir, Threshold: 0.5})
+	err := runGC(&gcArgs{LogDir: dir, Threshold: 50})
 	require.NoError(t, err)
 
 	files := logFilesInDir(t, dir)
@@ -377,7 +377,7 @@ func TestGCThreeSegmentsCascadingShadow(t *testing.T) {
 
 func TestGCEmptyDirectory(t *testing.T) {
 	dir := t.TempDir()
-	err := runGC(&gcArgs{LogDir: dir, Threshold: 0.5})
+	err := runGC(&gcArgs{LogDir: dir, Threshold: 50})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "no .log files")
 }
@@ -419,7 +419,7 @@ func TestGCReplayConsistencyPartialShadow(t *testing.T) {
 	replayBefore := filepath.Join(t.TempDir(), "before.img")
 	replayToFile(t, dir, replayBefore)
 
-	err := runGC(&gcArgs{LogDir: dir, Threshold: 0.6})
+	err := runGC(&gcArgs{LogDir: dir, Threshold: 60})
 	require.NoError(t, err)
 
 	replayAfter := filepath.Join(t.TempDir(), "after.img")
@@ -441,7 +441,7 @@ func TestGCMixedWriteAndTrimLiveness(t *testing.T) {
 		makeWriteEntry(10, 1, 1, 'C'),
 	})
 
-	err := runGC(&gcArgs{LogDir: dir, Threshold: 0.6})
+	err := runGC(&gcArgs{LogDir: dir, Threshold: 60})
 	require.NoError(t, err)
 
 	files := logFilesInDir(t, dir)
@@ -487,7 +487,7 @@ func TestGCExtentSplitting(t *testing.T) {
 	replayBefore := filepath.Join(t.TempDir(), "before.img")
 	replayToFile(t, dir, replayBefore)
 
-	err := runGC(&gcArgs{LogDir: dir, Threshold: 0.6})
+	err := runGC(&gcArgs{LogDir: dir, Threshold: 60})
 	require.NoError(t, err)
 
 	files := logFilesInDir(t, dir)
@@ -538,7 +538,7 @@ func TestGCExtentSplittingTrim(t *testing.T) {
 	replayBefore := filepath.Join(t.TempDir(), "before.img")
 	replayToFile(t, dir, replayBefore)
 
-	err := runGC(&gcArgs{LogDir: dir, Threshold: 0.6})
+	err := runGC(&gcArgs{LogDir: dir, Threshold: 60})
 	require.NoError(t, err)
 
 	files := logFilesInDir(t, dir)

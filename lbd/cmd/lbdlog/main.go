@@ -7,8 +7,11 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/binary"
+	"hash/crc32"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -23,6 +26,12 @@ import (
 	"miren.dev/mflags"
 	_ "modernc.org/sqlite"
 )
+
+// logSource represents a log file that can be opened for reading.
+type logSource struct {
+	Name string
+	Open func() (io.ReadCloser, error)
+}
 
 func fmtSize(b uint64) string {
 	switch {
@@ -143,84 +152,203 @@ func runShow(cfg *showArgs) error {
 
 type replayArgs struct {
 	QCow2      bool   `long:"qcow2" usage:"output as qcow2-lz4 image instead of flat file"`
+	DB         string `long:"db" usage:"path to SQLite database for incremental replay"`
+	S3Bucket   string `long:"s3-bucket" usage:"S3 bucket containing log files"`
+	S3Prefix   string `long:"s3-prefix" usage:"S3 key prefix"`
+	S3Endpoint string `long:"s3-endpoint" usage:"S3-compatible endpoint URL"`
+	S3Region   string `long:"s3-region" usage:"AWS region for S3"`
+	VolName    string `long:"vol-name" usage:"volume name (required with --s3-bucket)"`
 	LogDir     string `position:"0" usage:"directory containing log files"`
 	OutputPath string `position:"1" usage:"path to write reconstructed backing file"`
 }
 
 func runReplay(cfg *replayArgs) error {
-	logDir := cfg.LogDir
-	outputPath := cfg.OutputPath
+	var logs []logSource
+	var outputPath string
 
-	// Step A: Discover and sort log files
-	dirEntries, err := os.ReadDir(logDir)
-	if err != nil {
-		return fmt.Errorf("reading log directory: %w", err)
-	}
-
-	var logFiles []string
-	for _, de := range dirEntries {
-		if de.IsDir() {
-			continue
+	if cfg.S3Bucket != "" {
+		// S3 mode: position 0 is the output path
+		if cfg.VolName == "" {
+			return fmt.Errorf("--vol-name is required with --s3-bucket")
 		}
-		name := de.Name()
-		if strings.HasSuffix(name, ".log") || strings.HasSuffix(name, ".log.tmp") {
-			logFiles = append(logFiles, filepath.Join(logDir, name))
+		outputPath = cfg.LogDir // position 0
+		if outputPath == "" {
+			return fmt.Errorf("output path required")
+		}
+
+		ctx := context.Background()
+		uploader, err := lbd.NewS3Uploader(ctx, lbd.S3UploaderConfig{
+			Bucket:   cfg.S3Bucket,
+			Prefix:   cfg.S3Prefix,
+			Endpoint: cfg.S3Endpoint,
+			Region:   cfg.S3Region,
+		})
+		if err != nil {
+			return fmt.Errorf("creating S3 client: %w", err)
+		}
+
+		keys, err := uploader.ListLogs(ctx, cfg.VolName)
+		if err != nil {
+			return err
+		}
+		if len(keys) == 0 {
+			return fmt.Errorf("no log files found in s3://%s/%s", cfg.S3Bucket, cfg.VolName)
+		}
+
+		for _, k := range keys {
+			key := k // capture for closure
+			logs = append(logs, logSource{
+				Name: "s3://" + cfg.S3Bucket + "/" + key,
+				Open: func() (io.ReadCloser, error) {
+					return uploader.OpenLog(ctx, key)
+				},
+			})
+		}
+	} else {
+		// Local mode
+		logDir := cfg.LogDir
+		outputPath = cfg.OutputPath
+
+		dirEntries, err := os.ReadDir(logDir)
+		if err != nil {
+			return fmt.Errorf("reading log directory: %w", err)
+		}
+
+		var logFiles []string
+		for _, de := range dirEntries {
+			if de.IsDir() {
+				continue
+			}
+			name := de.Name()
+			if strings.HasSuffix(name, ".log") || strings.HasSuffix(name, ".log.tmp") {
+				logFiles = append(logFiles, filepath.Join(logDir, name))
+			}
+		}
+
+		sort.Strings(logFiles)
+
+		if len(logFiles) == 0 {
+			return fmt.Errorf("no log files found in %s", logDir)
+		}
+
+		for _, p := range logFiles {
+			path := p // capture for closure
+			logs = append(logs, logSource{
+				Name: path,
+				Open: func() (io.ReadCloser, error) {
+					return os.Open(path)
+				},
+			})
 		}
 	}
 
-	sort.Strings(logFiles)
+	// Incremental replay: filter logs to only new ones
+	var db *sql.DB
+	var lastReplayedLabel string
+	if cfg.DB != "" {
+		var err error
+		db, err = lbd.OpenDB(cfg.DB)
+		if err != nil {
+			return fmt.Errorf("opening replay database: %w", err)
+		}
+		defer db.Close()
 
-	if len(logFiles) == 0 {
-		return fmt.Errorf("no log files found in %s", logDir)
+		lastReplayedLabel, err = lbd.GetLabel(db, "last_replayed_label")
+		if err != nil {
+			return err
+		}
 	}
 
-	// Step B: Read first header for device metadata
-	firstFile, err := os.Open(logFiles[0])
+	if lastReplayedLabel != "" {
+		filtered := logs[:0]
+		for _, l := range logs {
+			label := lbd.LabelFromLogPath(l.Name)
+			if label > lastReplayedLabel {
+				filtered = append(filtered, l)
+			}
+		}
+		logs = filtered
+
+		if len(logs) == 0 {
+			fmt.Println("No new log files to replay")
+			return nil
+		}
+	}
+
+	// Read first header for device metadata
+	firstRC, err := logs[0].Open()
 	if err != nil {
 		return fmt.Errorf("opening first log file: %w", err)
 	}
 
-	firstRd, err := lbd.NewReader(firstFile)
+	firstRd, err := lbd.NewReader(firstRC)
 	if err != nil {
-		firstFile.Close()
-		return fmt.Errorf("reading header from %s: %w", logFiles[0], err)
+		firstRC.Close()
+		return fmt.Errorf("reading header from %s: %w", logs[0].Name, err)
 	}
 
 	deviceSize := firstRd.Header.DeviceSize
 	blockSize := firstRd.Header.BlockSize
-	firstFile.Close()
+	firstRC.Close()
 
-	// Step C: Create output and replay
+	incremental := lastReplayedLabel != ""
+
+	// Create output and replay
 	if cfg.QCow2 {
-		return replayToQCow2(logFiles, outputPath, deviceSize, blockSize)
+		err = replayToQCow2(logs, outputPath, deviceSize, blockSize, incremental)
+	} else {
+		err = replayToFlat(logs, outputPath, deviceSize, blockSize, incremental)
 	}
-	return replayToFlat(logFiles, outputPath, deviceSize, blockSize)
+	if err != nil {
+		return err
+	}
+
+	// Record last replayed label
+	if db != nil {
+		lastLog := logs[len(logs)-1]
+		label := lbd.LabelFromLogPath(lastLog.Name)
+		if err := lbd.SetLabel(db, "last_replayed_label", label); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
-func replayToFlat(logFiles []string, outputPath string, deviceSize uint64, blockSize uint32) error {
-	outFile, err := os.Create(outputPath)
-	if err != nil {
-		return fmt.Errorf("creating output file: %w", err)
+func replayToFlat(logs []logSource, outputPath string, deviceSize uint64, blockSize uint32, incremental bool) error {
+	var outFile *os.File
+	var err error
+
+	if incremental {
+		outFile, err = os.OpenFile(outputPath, os.O_RDWR, 0666)
+		if err != nil {
+			return fmt.Errorf("opening output file for incremental replay: %w", err)
+		}
+	} else {
+		outFile, err = os.Create(outputPath)
+		if err != nil {
+			return fmt.Errorf("creating output file: %w", err)
+		}
+		if err := outFile.Truncate(int64(deviceSize)); err != nil {
+			outFile.Close()
+			return fmt.Errorf("setting output file size: %w", err)
+		}
 	}
 	defer outFile.Close()
-
-	if err := outFile.Truncate(int64(deviceSize)); err != nil {
-		return fmt.Errorf("setting output file size: %w", err)
-	}
 
 	var totalEntries, totalWrites, totalTrims, crcErrors int
 	var totalBytes uint64
 
-	for _, logPath := range logFiles {
-		f, err := os.Open(logPath)
+	for _, log := range logs {
+		f, err := log.Open()
 		if err != nil {
-			return fmt.Errorf("opening %s: %w", logPath, err)
+			return fmt.Errorf("opening %s: %w", log.Name, err)
 		}
 
 		rd, err := lbd.NewReader(f)
 		if err != nil {
 			f.Close()
-			return fmt.Errorf("reading header from %s: %w", logPath, err)
+			return fmt.Errorf("reading header from %s: %w", log.Name, err)
 		}
 
 		for {
@@ -230,7 +358,7 @@ func replayToFlat(logFiles []string, outputPath string, deviceSize uint64, block
 			}
 			if err != nil {
 				f.Close()
-				return fmt.Errorf("reading entry from %s: %w", logPath, err)
+				return fmt.Errorf("reading entry from %s: %w", log.Name, err)
 			}
 
 			totalEntries++
@@ -239,7 +367,7 @@ func replayToFlat(logFiles []string, outputPath string, deviceSize uint64, block
 			if e.IsWrite() {
 				if !e.ValidateCRC() {
 					crcErrors++
-					fmt.Fprintf(os.Stderr, "Warning: CRC mismatch at entry seq=%d in %s\n", e.Sequence, logPath)
+					fmt.Fprintf(os.Stderr, "Warning: CRC mismatch at entry seq=%d in %s\n", e.Sequence, log.Name)
 				}
 				if _, err := outFile.WriteAt(e.Data, offset); err != nil {
 					f.Close()
@@ -269,34 +397,44 @@ func replayToFlat(logFiles []string, outputPath string, deviceSize uint64, block
 	}
 
 	fmt.Printf("Replayed %d entries (%d writes, %d trims) from %d segments\n",
-		totalEntries, totalWrites, totalTrims, len(logFiles))
+		totalEntries, totalWrites, totalTrims, len(logs))
 	fmt.Printf("Output: %s (%s)\n", outputPath, fmtSize(deviceSize))
 	fmt.Printf("CRC errors: %d\n", crcErrors)
 
 	return nil
 }
 
-func replayToQCow2(logFiles []string, outputPath string, deviceSize uint64, blockSize uint32) error {
-	img, err := lbd.CreateQCow2(outputPath, deviceSize, 16)
-	if err != nil {
-		return fmt.Errorf("creating qcow2 image: %w", err)
+func replayToQCow2(logs []logSource, outputPath string, deviceSize uint64, blockSize uint32, incremental bool) error {
+	var img *lbd.QCow2Image
+	var err error
+
+	if incremental {
+		img, err = lbd.OpenQCow2(outputPath)
+		if err != nil {
+			return fmt.Errorf("opening qcow2 image for incremental replay: %w", err)
+		}
+	} else {
+		img, err = lbd.CreateQCow2(outputPath, deviceSize, 16)
+		if err != nil {
+			return fmt.Errorf("creating qcow2 image: %w", err)
+		}
 	}
 
 	var totalEntries, totalWrites, totalTrims, crcErrors int
 	var totalBytes uint64
 
-	for _, logPath := range logFiles {
-		f, err := os.Open(logPath)
+	for _, log := range logs {
+		f, err := log.Open()
 		if err != nil {
 			img.Close()
-			return fmt.Errorf("opening %s: %w", logPath, err)
+			return fmt.Errorf("opening %s: %w", log.Name, err)
 		}
 
 		rd, err := lbd.NewReader(f)
 		if err != nil {
 			f.Close()
 			img.Close()
-			return fmt.Errorf("reading header from %s: %w", logPath, err)
+			return fmt.Errorf("reading header from %s: %w", log.Name, err)
 		}
 
 		for {
@@ -307,7 +445,7 @@ func replayToQCow2(logFiles []string, outputPath string, deviceSize uint64, bloc
 			if err != nil {
 				f.Close()
 				img.Close()
-				return fmt.Errorf("reading entry from %s: %w", logPath, err)
+				return fmt.Errorf("reading entry from %s: %w", log.Name, err)
 			}
 
 			totalEntries++
@@ -316,7 +454,7 @@ func replayToQCow2(logFiles []string, outputPath string, deviceSize uint64, bloc
 			if e.IsWrite() {
 				if !e.ValidateCRC() {
 					crcErrors++
-					fmt.Fprintf(os.Stderr, "Warning: CRC mismatch at entry seq=%d in %s\n", e.Sequence, logPath)
+					fmt.Fprintf(os.Stderr, "Warning: CRC mismatch at entry seq=%d in %s\n", e.Sequence, log.Name)
 				}
 				if _, err := img.WriteAt(e.Data, offset); err != nil {
 					f.Close()
@@ -344,7 +482,7 @@ func replayToQCow2(logFiles []string, outputPath string, deviceSize uint64, bloc
 	}
 
 	fmt.Printf("Replayed %d entries (%d writes, %d trims) from %d segments\n",
-		totalEntries, totalWrites, totalTrims, len(logFiles))
+		totalEntries, totalWrites, totalTrims, len(logs))
 	fmt.Printf("Output: %s (qcow2-lz4, virtual %s)\n", outputPath, fmtSize(deviceSize))
 	fmt.Printf("CRC errors: %d\n", crcErrors)
 
@@ -356,36 +494,62 @@ func tai64nLabel() string {
 }
 
 type repackArgs struct {
-	Inplace  bool   `long:"inplace" usage:"write repacked file into log dir and remove old segments"`
-	LogDir   string `position:"0" usage:"directory containing log segment files"`
-	OutputDir string `position:"1" usage:"directory to write repacked log file"`
+	Inplace    bool   `long:"inplace" usage:"write repacked file into log dir and remove old segments"`
+	S3Bucket   string `long:"s3-bucket" usage:"S3 bucket containing log files"`
+	S3Prefix   string `long:"s3-prefix" usage:"S3 key prefix"`
+	S3Endpoint string `long:"s3-endpoint" usage:"S3-compatible endpoint URL"`
+	S3Region   string `long:"s3-region" usage:"AWS region for S3"`
+	VolName    string `long:"vol-name" usage:"volume name (required with --s3-bucket)"`
+	LogDir     string `position:"0" usage:"directory containing log segment files"`
+	OutputDir  string `position:"1" usage:"directory to write repacked log file"`
 }
 
-
 func runRepack(cfg *repackArgs) error {
-	if !cfg.Inplace && cfg.OutputDir == "" {
-		return fmt.Errorf("output directory required (or use --inplace)")
+	ctx := context.Background()
+
+	var store lbd.LogStore
+	if cfg.S3Bucket != "" {
+		if cfg.VolName == "" {
+			return fmt.Errorf("--vol-name is required with --s3-bucket")
+		}
+		u, err := lbd.NewS3Uploader(ctx, lbd.S3UploaderConfig{
+			Bucket:   cfg.S3Bucket,
+			Prefix:   cfg.S3Prefix,
+			Endpoint: cfg.S3Endpoint,
+			Region:   cfg.S3Region,
+		})
+		if err != nil {
+			return fmt.Errorf("creating S3 client: %w", err)
+		}
+		store = lbd.NewS3LogStore(u, cfg.VolName)
+	} else {
+		if cfg.LogDir == "" {
+			return fmt.Errorf("log directory or --s3-bucket is required")
+		}
+		if !cfg.Inplace && cfg.OutputDir == "" {
+			return fmt.Errorf("output directory required (or use --inplace)")
+		}
+		store = &lbd.DirLogStore{Dir: cfg.LogDir}
 	}
 
-	// Step 1: Discover .log files, skip .log.tmp
-	logFiles, err := lbd.DiscoverLogFiles(cfg.LogDir)
+	// Step 1: Discover log files
+	logFiles, err := store.List(ctx)
 	if err != nil {
 		return err
 	}
-
 	if len(logFiles) == 0 {
-		return fmt.Errorf("no .log files found in %s", cfg.LogDir)
+		return fmt.Errorf("no .log files found")
 	}
 
 	// Step 2: Read header from first file for device metadata
-	firstFile, err := os.Open(logFiles[0])
+	firstRC, err := store.Open(ctx, logFiles[0])
 	if err != nil {
 		return fmt.Errorf("opening first log file: %w", err)
 	}
 
-	firstRd, err := lbd.NewReader(firstFile)
+	firstRd, err := lbd.NewReader(firstRC)
 	if err != nil {
-		firstFile.Close()
+		firstRC.Close()
 		return fmt.Errorf("reading header from %s: %w", logFiles[0], err)
 	}
 
@@ -398,40 +562,23 @@ func runRepack(cfg *repackArgs) error {
 		DeviceSize:   firstRd.Header.DeviceSize,
 		BackingPath:  firstRd.Header.BackingPath,
 	}
-	firstFile.Close()
+	firstRC.Close()
 
-	// Step 3: Determine output path
-	outDir := cfg.OutputDir
-	if cfg.Inplace {
-		outDir = cfg.LogDir
-	}
+	// Step 3: Read all entries, deduplicate via reverse BlockSet analysis,
+	// and write only live portions to the output.
+	var allEntries []*lbd.Entry
+	var allNumBlocks []uint64
 
-	tmpPath := filepath.Join(outDir, "disk."+label+".log.tmp")
-
-	outFile, err := os.Create(tmpPath)
-	if err != nil {
-		return fmt.Errorf("creating output file: %w", err)
-	}
-	defer outFile.Close()
-
-	wr, err := lbd.NewWriter(outFile, outHdr)
-	if err != nil {
-		return fmt.Errorf("writing output header: %w", err)
-	}
-
-	// Step 4: Read all input files and write entries to output
-	var totalEntries int
-
-	for _, logPath := range logFiles {
-		f, err := os.Open(logPath)
+	for _, logID := range logFiles {
+		rc, err := store.Open(ctx, logID)
 		if err != nil {
-			return fmt.Errorf("opening %s: %w", logPath, err)
+			return fmt.Errorf("opening %s: %w", logID, err)
 		}
 
-		rd, err := lbd.NewReader(f)
+		rd, err := lbd.NewReader(rc)
 		if err != nil {
-			f.Close()
-			return fmt.Errorf("reading header from %s: %w", logPath, err)
+			rc.Close()
+			return fmt.Errorf("reading header from %s: %w", logID, err)
 		}
 
 		for {
@@ -440,35 +587,126 @@ func runRepack(cfg *repackArgs) error {
 				break
 			}
 			if err != nil {
-				f.Close()
-				return fmt.Errorf("reading entry from %s: %w", logPath, err)
+				rc.Close()
+				return fmt.Errorf("reading entry from %s: %w", logID, err)
 			}
 
-			if err := wr.WriteEntry(e); err != nil {
-				f.Close()
+			numBlocks := uint64(e.Length) / uint64(outHdr.BlockSize)
+			if numBlocks == 0 {
+				numBlocks = 1
+			}
+			allEntries = append(allEntries, e)
+			allNumBlocks = append(allNumBlocks, numBlocks)
+		}
+
+		rc.Close()
+	}
+
+	// Reverse BlockSet analysis: walk entries backwards to find which
+	// block ranges in each entry are not shadowed by later entries.
+	var covered lbd.BlockSet
+	liveRanges := make([][]lbd.Interval, len(allEntries))
+	for i := len(allEntries) - 1; i >= 0; i-- {
+		lo := allEntries[i].Block
+		hi := lo + allNumBlocks[i]
+		uncovered := covered.Uncovered(lo, hi)
+		liveRanges[i] = uncovered
+		if len(uncovered) > 0 {
+			covered.Add(lo, hi)
+		}
+	}
+
+	// Write deduplicated entries to temp file.
+	tmpFile, err := os.CreateTemp("", "lbd-repack-*.log.tmp")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	wr, err := lbd.NewWriter(tmpFile, outHdr)
+	if err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("writing output header: %w", err)
+	}
+
+	var totalEntries int
+	var seq uint64
+	blockSize := outHdr.BlockSize
+
+	for i, e := range allEntries {
+		for _, r := range liveRanges[i] {
+			out := &lbd.Entry{
+				Op:          e.Op,
+				TimestampNS: e.TimestampNS,
+				Sequence:    seq,
+				Block:       r.Lo,
+			}
+			seq++
+
+			if e.IsWrite() {
+				dataStart := (r.Lo - e.Block) * uint64(blockSize)
+				dataEnd := (r.Hi - e.Block) * uint64(blockSize)
+				slice := e.Data[dataStart:dataEnd]
+				out.Length = uint32(len(slice))
+				out.Checksum = crc32.ChecksumIEEE(slice)
+				out.Data = slice
+			} else {
+				out.Length = uint32((r.Hi - r.Lo) * uint64(blockSize))
+			}
+
+			if err := wr.WriteEntry(out); err != nil {
+				tmpFile.Close()
 				return fmt.Errorf("writing entry: %w", err)
 			}
 			totalEntries++
 		}
-
-		f.Close()
 	}
 
-	// Step 5: Rename tmp to final; for --inplace also remove old segments
-	finalPath := filepath.Join(outDir, "disk."+label+".log")
-	if err := os.Rename(tmpPath, finalPath); err != nil {
-		return fmt.Errorf("renaming temp file: %w", err)
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("closing temp file: %w", err)
 	}
 
-	if cfg.Inplace {
-		for _, logPath := range logFiles {
-			if err := os.Remove(logPath); err != nil {
-				return fmt.Errorf("removing old segment %s: %w", logPath, err)
+	// Step 4: Store the repacked file and optionally remove old segments
+	if cfg.S3Bucket != "" {
+		// S3 mode: always inplace (upload new, delete old)
+		finalID := store.LogPath(label)
+		if err := store.Put(ctx, finalID, tmpPath); err != nil {
+			return fmt.Errorf("uploading repacked segment: %w", err)
+		}
+
+		for _, logID := range logFiles {
+			if err := store.Delete(ctx, logID); err != nil {
+				return fmt.Errorf("removing old segment %s: %w", logID, err)
 			}
 		}
-	}
 
-	fmt.Printf("Repacked %d entries from %d files into %s\n", totalEntries, len(logFiles), finalPath)
+		fmt.Printf("Repacked %d entries from %d files into %s\n", totalEntries, len(logFiles), finalID)
+	} else {
+		// Local mode
+		outDir := cfg.OutputDir
+		if cfg.Inplace {
+			outDir = cfg.LogDir
+		}
+
+		finalPath := filepath.Join(outDir, "disk."+label+".log")
+		if err := os.Rename(tmpPath, finalPath); err != nil {
+			// Cross-filesystem: fall back to store.Put
+			if err := store.Put(ctx, finalPath, tmpPath); err != nil {
+				return fmt.Errorf("storing repacked segment: %w", err)
+			}
+		}
+
+		if cfg.Inplace {
+			for _, logID := range logFiles {
+				if err := os.Remove(logID); err != nil {
+					return fmt.Errorf("removing old segment %s: %w", logID, err)
+				}
+			}
+		}
+
+		fmt.Printf("Repacked %d entries from %d files into %s\n", totalEntries, len(logFiles), finalPath)
+	}
 
 	return nil
 }
@@ -501,17 +739,41 @@ func runScan(cfg *scanArgs) error {
 }
 
 type gcArgs struct {
-	Threshold float64 `long:"threshold" usage:"utilization threshold (0.0-1.0) below which segments are retired"`
-	DryRun    bool    `long:"dry-run" usage:"show utilization without retiring segments"`
-	LogDir    string  `position:"0" usage:"directory containing log segment files"`
+	Threshold  int `long:"threshold" usage:"utilization threshold percentage (0-100) below which segments are retired" default:"50"`
+	DryRun     bool    `long:"dry-run" usage:"show utilization without retiring segments"`
+	LogDir     string  `position:"0" usage:"directory containing log segment files"`
+	VolName    string  `long:"vol-name" usage:"volume name for S3 key prefix"`
+	S3Bucket   string  `long:"s3-bucket" usage:"S3 bucket for log storage"`
+	S3Prefix   string  `long:"s3-prefix" usage:"S3 key prefix"`
+	S3Endpoint string  `long:"s3-endpoint" usage:"S3-compatible endpoint URL"`
+	S3Region   string  `long:"s3-region" usage:"AWS region for S3"`
 }
 
 func runGC(cfg *gcArgs) error {
-	result, err := lbd.RunGC(lbd.GCConfig{
-		LogDir:    cfg.LogDir,
+	gcCfg := lbd.GCConfig{
 		Threshold: cfg.Threshold,
 		DryRun:    cfg.DryRun,
-	})
+	}
+
+	if cfg.S3Bucket != "" {
+		u, err := lbd.NewS3Uploader(context.Background(), lbd.S3UploaderConfig{
+			Bucket:   cfg.S3Bucket,
+			Prefix:   cfg.S3Prefix,
+			Endpoint: cfg.S3Endpoint,
+			Region:   cfg.S3Region,
+		})
+		if err != nil {
+			return fmt.Errorf("creating S3 client: %w", err)
+		}
+		gcCfg.Store = lbd.NewS3LogStore(u, cfg.VolName)
+	} else {
+		if cfg.LogDir == "" {
+			return fmt.Errorf("log directory or --s3-bucket is required")
+		}
+		gcCfg.LogDir = cfg.LogDir
+	}
+
+	result, err := lbd.RunGC(context.Background(), gcCfg)
 	if err != nil {
 		return err
 	}
@@ -541,12 +803,12 @@ func runGC(cfg *gcArgs) error {
 	fmt.Println()
 
 	if len(result.RetireIndexes) == 0 {
-		fmt.Printf("No segments below %.0f%% utilization threshold.\n", result.Threshold*100.0)
+		fmt.Printf("No segments below %d%% utilization threshold.\n", result.Threshold)
 		return nil
 	}
 
-	fmt.Printf("%d segment(s) below %.0f%% utilization threshold.\n",
-		len(result.RetireIndexes), result.Threshold*100.0)
+	fmt.Printf("%d segment(s) below %d%% utilization threshold.\n",
+		len(result.RetireIndexes), result.Threshold)
 
 	if cfg.DryRun {
 		return nil
