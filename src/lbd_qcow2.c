@@ -8,6 +8,7 @@
  */
 
 #include <linux/blkdev.h>
+#include <linux/crc32c.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/highmem.h>
@@ -273,7 +274,7 @@ lbd_qcow2_l2_get(struct lbd_device *dev, u32 l1_index)
 					disk_l2[j] = cpu_to_be64(best->table[j]);
 
 				/* CRC32C trailer */
-				crc = ~__crc32c_le(~0, raw, q->cluster_size - 4);
+				crc = ~crc32c(~0, raw, q->cluster_size - 4);
 				crc_be = cpu_to_be32(crc);
 				memcpy(raw + q->cluster_size - 4, &crc_be, 4);
 
@@ -319,7 +320,7 @@ lbd_qcow2_l2_get(struct lbd_device *dev, u32 l1_index)
 		{
 			u8 *raw = (u8 *)disk_l2;
 			u32 stored_crc = _qcow2_get32(raw, q->cluster_size - 4);
-			u32 calc_crc = ~__crc32c_le(~0, raw, q->cluster_size - 4);
+			u32 calc_crc = ~crc32c(~0, raw, q->cluster_size - 4);
 
 			if (stored_crc != calc_crc) {
 				pr_warn("lbd%d: L2 CRC32C mismatch for l1[%u]: "
@@ -374,7 +375,7 @@ static int lbd_qcow2_l2_flush(struct lbd_device *dev,
 	/* Compute and store CRC32C trailer at end of cluster */
 	{
 		u8 *raw = (u8 *)disk_l2;
-		u32 crc = ~__crc32c_le(~0, raw, q->cluster_size - 4);
+		u32 crc = ~crc32c(~0, raw, q->cluster_size - 4);
 		__be32 crc_be = cpu_to_be32(crc);
 
 		memcpy(raw + q->cluster_size - 4, &crc_be, 4);
@@ -420,7 +421,7 @@ static int lbd_qcow2_l2_alloc(struct lbd_device *dev, u32 l1_index)
 		memset(zeros, 0, q->cluster_size);
 
 		/* CRC32C of all-zero data (covers bytes [0, cluster_size-4)) */
-		crc = ~__crc32c_le(~0, zeros, q->cluster_size - 4);
+		crc = ~crc32c(~0, zeros, q->cluster_size - 4);
 		crc_be = cpu_to_be32(crc);
 		memcpy(zeros + q->cluster_size - 4, &crc_be, 4);
 
@@ -1434,7 +1435,7 @@ lbd_qcow2_base_l2_get(struct lbd_qcow2_base *base, u32 l1_index)
 		{
 			u8 *raw = (u8 *)disk_l2;
 			u32 stored_crc = _qcow2_get32(raw, base->cluster_size - 4);
-			u32 calc_crc = ~__crc32c_le(~0, raw, base->cluster_size - 4);
+			u32 calc_crc = ~crc32c(~0, raw, base->cluster_size - 4);
 
 			if (stored_crc != calc_crc) {
 				pr_warn("lbd: base L2 CRC32C mismatch for l1[%u]: "

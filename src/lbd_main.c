@@ -20,10 +20,13 @@
 #include <linux/slab.h>
 #include <linux/ktime.h>
 #include <linux/namei.h>
-#include <linux/mnt_idmapping.h>
 #include <linux/falloc.h>
 
 #include "lbd.h"
+
+#if LBD_HAS_MNT_IDMAP
+#include <linux/mnt_idmapping.h>
+#endif
 #include "lbd_qcow2.h"
 #include "cbor_enc.h"
 #include "cbor_dec.h"
@@ -98,9 +101,15 @@ struct lbd_ctl_state {
  * Block device operations
  * ---------------------------------------------------------------- */
 
+#if LBD_HAS_GENDISK_OPEN
 static int lbd_open(struct gendisk *disk, unsigned int mode)
 {
 	struct lbd_device *dev = disk->private_data;
+#else
+static int lbd_open(struct block_device *bdev, fmode_t mode)
+{
+	struct lbd_device *dev = bdev->bd_disk->private_data;
+#endif
 
 	if (dev->state != LBD_STATE_BOUND)
 		return -ENXIO;
@@ -108,9 +117,15 @@ static int lbd_open(struct gendisk *disk, unsigned int mode)
 	return 0;
 }
 
+#if LBD_HAS_GENDISK_OPEN
 static void lbd_release(struct gendisk *disk)
 {
 	struct lbd_device *dev = disk->private_data;
+#else
+static void lbd_release(struct gendisk *disk, fmode_t mode)
+{
+	struct lbd_device *dev = disk->private_data;
+#endif
 
 	atomic_dec(&dev->open_count);
 }
@@ -630,19 +645,48 @@ static int lbd_rename_file(struct file *old_file, const char *new_basename)
 
 	lock_rename(parent, parent);
 
+#if LBD_HAS_LOOKUP_ONE_QSTR
+	{
+		struct qstr qname = QSTR_INIT(new_basename,
+					      strlen(new_basename));
+		new_dentry = lookup_one(&nop_mnt_idmap, &qname, parent);
+	}
+#elif LBD_HAS_RENAME_NO_DIR
+	new_dentry = lookup_one(&nop_mnt_idmap, new_basename, parent,
+				strlen(new_basename));
+#else
 	new_dentry = lookup_one_len(new_basename, parent, strlen(new_basename));
+#endif
 	if (IS_ERR(new_dentry)) {
 		ret = PTR_ERR(new_dentry);
 		goto out_unlock;
 	}
 
 	memset(&rd, 0, sizeof(rd));
+#if LBD_HAS_RENAME_SINGLE_IDMAP
+	rd.mnt_idmap = &nop_mnt_idmap;
+	rd.old_dentry = old_dentry;
+	rd.new_dentry = new_dentry;
+#elif LBD_HAS_RENAME_NO_DIR
+	rd.old_mnt_idmap = &nop_mnt_idmap;
+	rd.old_dentry = old_dentry;
+	rd.new_mnt_idmap = &nop_mnt_idmap;
+	rd.new_dentry = new_dentry;
+#elif LBD_HAS_MNT_IDMAP
 	rd.old_mnt_idmap = &nop_mnt_idmap;
 	rd.old_dir = d_inode(parent);
 	rd.old_dentry = old_dentry;
 	rd.new_mnt_idmap = &nop_mnt_idmap;
 	rd.new_dir = d_inode(parent);
 	rd.new_dentry = new_dentry;
+#else
+	rd.old_mnt_userns = &init_user_ns;
+	rd.old_dir = d_inode(parent);
+	rd.old_dentry = old_dentry;
+	rd.new_mnt_userns = &init_user_ns;
+	rd.new_dir = d_inode(parent);
+	rd.new_dentry = new_dentry;
+#endif
 
 	ret = vfs_rename(&rd);
 	dput(new_dentry);
@@ -884,14 +928,35 @@ static int lbd_add_device(struct lbd_ctl_add __user *uarg)
 	dev->tag_set.queue_depth = LBD_QUEUE_DEPTH;
 	dev->tag_set.numa_node = NUMA_NO_NODE;
 	dev->tag_set.cmd_size = sizeof(struct lbd_cmd);
+#if LBD_HAS_QUEUE_LIMITS_API
+	dev->tag_set.flags = 0;
+#else
 	dev->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
+#endif
 
 	ret = blk_mq_alloc_tag_set(&dev->tag_set);
 	if (ret)
 		goto err_idr;
 
 	/* Allocate gendisk - version dependent */
-#if LBD_HAS_BLK_MQ_ALLOC_DISK
+#if LBD_HAS_QUEUE_LIMITS_API
+	{
+		struct queue_limits lim = {
+			.logical_block_size = LBD_BLOCK_SIZE,
+			.physical_block_size = LBD_BLOCK_SIZE,
+			.max_hw_sectors = 256,
+			.features = BLK_FEAT_WRITE_CACHE,
+			.max_hw_discard_sectors = UINT_MAX >> SECTOR_SHIFT,
+			.discard_granularity = LBD_BLOCK_SIZE,
+		};
+		dev->gd = blk_mq_alloc_disk(&dev->tag_set, &lim, dev);
+	}
+	if (IS_ERR(dev->gd)) {
+		ret = PTR_ERR(dev->gd);
+		dev->gd = NULL;
+		goto err_tagset;
+	}
+#elif LBD_HAS_BLK_MQ_ALLOC_DISK
 	dev->gd = blk_mq_alloc_disk(&dev->tag_set, dev);
 	if (IS_ERR(dev->gd)) {
 		ret = PTR_ERR(dev->gd);
@@ -1004,7 +1069,8 @@ static int lbd_add_device(struct lbd_ctl_add __user *uarg)
 	/* Set capacity and activate */
 	set_capacity(dev->gd, dev->size >> SECTOR_SHIFT);
 
-	/* Set queue limits */
+	/* Set queue limits (on 6.9+ these are set via struct queue_limits above) */
+#if !LBD_HAS_QUEUE_LIMITS_API
 	blk_queue_logical_block_size(dev->gd->queue, LBD_BLOCK_SIZE);
 	blk_queue_physical_block_size(dev->gd->queue, LBD_BLOCK_SIZE);
 	blk_queue_max_hw_sectors(dev->gd->queue, 256); /* 128K max per request */
@@ -1012,6 +1078,7 @@ static int lbd_add_device(struct lbd_ctl_add __user *uarg)
 
 	blk_queue_max_discard_sectors(dev->gd->queue, UINT_MAX >> SECTOR_SHIFT);
 	dev->gd->queue->limits.discard_granularity = LBD_BLOCK_SIZE;
+#endif
 
 	dev->state = LBD_STATE_BOUND;
 

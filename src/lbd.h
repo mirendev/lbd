@@ -199,9 +199,52 @@ struct lbd_device {
 #define LBD_HAS_BLK_MQ_ALLOC_DISK 0
 #endif
 
-/*
- * blk_mode_t was introduced in 6.5, replacing fmode_t for block open.
- * Both are unsigned integers so we just use unsigned int directly.
- */
+/* 6.3+: struct mnt_idmap replaces struct user_namespace for VFS idmap ops;
+ *       nop_mnt_idmap replaces &init_user_ns */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+#define LBD_HAS_MNT_IDMAP 1
+#else
+#define LBD_HAS_MNT_IDMAP 0
+#endif
+
+/* 6.5+: block_device_operations.open takes struct gendisk * (was block_device *);
+ *       .release drops the fmode_t argument */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+#define LBD_HAS_GENDISK_OPEN 1
+#else
+#define LBD_HAS_GENDISK_OPEN 0
+#endif
+
+/* 6.9+: blk_mq_alloc_disk() takes struct queue_limits * as 2nd arg;
+ *       BLK_MQ_F_SHOULD_MERGE removed; blk_queue_* setters removed;
+ *       use BLK_FEAT_WRITE_CACHE in limits.features */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0)
+#define LBD_HAS_QUEUE_LIMITS_API 1
+#else
+#define LBD_HAS_QUEUE_LIMITS_API 0
+#endif
+
+/* 6.12+: struct renamedata drops old_dir/new_dir fields (derived from dentries);
+ *        lookup_one_len() removed, use lookup_one(idmap, name, dir, len) */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+#define LBD_HAS_RENAME_NO_DIR 1
+#else
+#define LBD_HAS_RENAME_NO_DIR 0
+#endif
+
+/* 6.15+: lookup_one() takes struct qstr * instead of (const char *, int) */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+#define LBD_HAS_LOOKUP_ONE_QSTR 1
+#else
+#define LBD_HAS_LOOKUP_ONE_QSTR 0
+#endif
+
+/* 6.18+: struct renamedata uses single mnt_idmap field
+ *        (replaces old_mnt_idmap/new_mnt_idmap) */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+#define LBD_HAS_RENAME_SINGLE_IDMAP 1
+#else
+#define LBD_HAS_RENAME_SINGLE_IDMAP 0
+#endif
 
 #endif /* _LBD_H */
