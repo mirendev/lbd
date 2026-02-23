@@ -66,6 +66,7 @@ struct lbd_watcher {
 static LIST_HEAD(lbd_watchers);
 static DEFINE_SPINLOCK(lbd_watchers_lock);
 
+#ifdef CONFIG_LBD_MISS_HANDLER
 /* ----------------------------------------------------------------
  * Block miss handler (for remote-fetch workflow)
  * ---------------------------------------------------------------- */
@@ -83,11 +84,14 @@ struct lbd_miss_handler {
 	bool                    has_event;
 	u64                     miss_cluster;
 };
+#endif /* CONFIG_LBD_MISS_HANDLER */
 
 /* Control fd state — supports both watch and miss handler on same fd */
 struct lbd_ctl_state {
 	struct lbd_watcher      *watcher;   /* NULL until "watch" command */
+#ifdef CONFIG_LBD_MISS_HANDLER
 	struct lbd_miss_handler *miss;      /* NULL until "manage_misses" command */
+#endif
 };
 
 /* ----------------------------------------------------------------
@@ -836,7 +840,9 @@ static int lbd_add_device(struct lbd_ctl_add __user *uarg)
 	strscpy(dev->log_dir, arg.log_dir, sizeof(dev->log_dir));
 	dev->state = LBD_STATE_UNBOUND;
 	spin_lock_init(&dev->cmd_lock);
+#ifdef CONFIG_LBD_MISS_HANDLER
 	spin_lock_init(&dev->miss_handler_lock);
+#endif
 	INIT_LIST_HEAD(&dev->cmd_list);
 	INIT_WORK(&dev->work, lbd_work_fn);
 	mutex_init(&dev->log_mutex);
@@ -1353,6 +1359,7 @@ static const struct attribute_group lbd_attr_group = {
 	.attrs = lbd_attrs,
 };
 
+#ifdef CONFIG_LBD_MISS_HANDLER
 /* ----------------------------------------------------------------
  * Miss handler helpers
  * ---------------------------------------------------------------- */
@@ -1415,6 +1422,7 @@ enum lbd_miss_action lbd_qcow2_handle_miss(struct lbd_device *dev,
 
 	return pending.action;
 }
+#endif /* CONFIG_LBD_MISS_HANDLER */
 
 /* ----------------------------------------------------------------
  * Watcher helpers
@@ -1533,6 +1541,7 @@ static int lbd_ctl_release(struct inode *inode, struct file *file)
 		kfree(state->watcher);
 	}
 
+#ifdef CONFIG_LBD_MISS_HANDLER
 	if (state->miss) {
 		struct lbd_miss_handler *mh = state->miss;
 		struct lbd_device *dev;
@@ -1559,6 +1568,7 @@ static int lbd_ctl_release(struct inode *inode, struct file *file)
 
 		kfree(mh);
 	}
+#endif
 
 	kfree(state);
 	file->private_data = NULL;
@@ -1643,6 +1653,7 @@ static ssize_t lbd_ctl_write(struct file *file, const char __user *ubuf,
 		return count;
 	}
 
+#ifdef CONFIG_LBD_MISS_HANDLER
 	if (strcmp(cmd, "manage_misses") == 0) {
 		struct lbd_device *dev;
 		struct lbd_miss_handler *mh;
@@ -1748,15 +1759,18 @@ static ssize_t lbd_ctl_write(struct file *file, const char __user *ubuf,
 
 		return count;
 	}
+#endif /* CONFIG_LBD_MISS_HANDLER */
 
 	return -EINVAL;
 }
 
 static bool lbd_ctl_has_event(struct lbd_ctl_state *state)
 {
-	struct lbd_miss_handler *mh = state->miss;
 	struct lbd_watcher *w = state->watcher;
 	struct lbd_watcher_event ev;
+
+#ifdef CONFIG_LBD_MISS_HANDLER
+	struct lbd_miss_handler *mh = state->miss;
 
 	if (mh) {
 		bool has;
@@ -1767,6 +1781,7 @@ static bool lbd_ctl_has_event(struct lbd_ctl_state *state)
 		if (has)
 			return true;
 	}
+#endif
 	if (w && lbd_watcher_peek(w, &ev))
 		return true;
 	return false;
@@ -1776,20 +1791,28 @@ static ssize_t lbd_ctl_read(struct file *file, char __user *ubuf,
 			    size_t count, loff_t *ppos)
 {
 	struct lbd_ctl_state *state = file->private_data;
-	struct lbd_miss_handler *mh;
 	struct lbd_watcher *w;
 	u8 tmp[512];
 	struct cbor_enc e;
 	size_t encoded_len;
+#ifdef CONFIG_LBD_MISS_HANDLER
+	struct lbd_miss_handler *mh;
+#endif
 
 	if (!state)
 		return -EINVAL;
 
-	mh = state->miss;
 	w = state->watcher;
+
+#ifdef CONFIG_LBD_MISS_HANDLER
+	mh = state->miss;
 
 	if (!mh && !w)
 		return -EINVAL;
+#else
+	if (!w)
+		return -EINVAL;
+#endif
 
 	/* Block until an event is available */
 	if (!lbd_ctl_has_event(state)) {
@@ -1798,6 +1821,7 @@ static ssize_t lbd_ctl_read(struct file *file, char __user *ubuf,
 		if (file->f_flags & O_NONBLOCK)
 			return -EAGAIN;
 
+#ifdef CONFIG_LBD_MISS_HANDLER
 		if (mh) {
 			ret = wait_event_interruptible(mh->wq,
 				lbd_ctl_has_event(state));
@@ -1805,10 +1829,15 @@ static ssize_t lbd_ctl_read(struct file *file, char __user *ubuf,
 			ret = wait_event_interruptible(w->wq,
 				lbd_ctl_has_event(state));
 		}
+#else
+		ret = wait_event_interruptible(w->wq,
+			lbd_ctl_has_event(state));
+#endif
 		if (ret)
 			return -ERESTARTSYS;
 	}
 
+#ifdef CONFIG_LBD_MISS_HANDLER
 	/* Miss events take priority (time-critical, I/O thread blocked) */
 	if (mh) {
 		bool has;
@@ -1849,6 +1878,7 @@ static ssize_t lbd_ctl_read(struct file *file, char __user *ubuf,
 			return encoded_len;
 		}
 	}
+#endif /* CONFIG_LBD_MISS_HANDLER */
 
 	/* Fall through to watcher events */
 	if (w) {
@@ -1908,30 +1938,40 @@ static __poll_t lbd_ctl_poll(struct file *file,
 			     struct poll_table_struct *wait)
 {
 	struct lbd_ctl_state *state = file->private_data;
-	struct lbd_miss_handler *mh;
 	struct lbd_watcher *w;
 	__poll_t mask = 0;
+#ifdef CONFIG_LBD_MISS_HANDLER
+	struct lbd_miss_handler *mh;
+#endif
 
 	if (!state)
 		return 0;
 
-	mh = state->miss;
 	w = state->watcher;
+
+#ifdef CONFIG_LBD_MISS_HANDLER
+	mh = state->miss;
 
 	if (!mh && !w)
 		return 0;
 
 	if (mh)
 		poll_wait(file, &mh->wq, wait);
+#else
+	if (!w)
+		return 0;
+#endif
 	if (w)
 		poll_wait(file, &w->wq, wait);
 
+#ifdef CONFIG_LBD_MISS_HANDLER
 	if (mh) {
 		spin_lock(&mh->lock);
 		if (mh->has_event)
 			mask |= EPOLLIN | EPOLLRDNORM;
 		spin_unlock(&mh->lock);
 	}
+#endif
 
 	if (w) {
 		spin_lock(&w->lock);

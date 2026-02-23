@@ -562,17 +562,21 @@ lbd_qcow2_cl_load(struct lbd_device *dev, u64 cluster_index)
 					cluster_index, ce->data);
 			if (err == 1) {
 				/* Unallocated in both primary and base */
+#ifdef CONFIG_LBD_MISS_HANDLER
 				if (dev->miss_handler)
 					return ERR_PTR(-ENODATA);
+#endif
 				/* No handler: zero-fill (backward compatible) */
 				memset(ce->data, 0, q->cluster_size);
 			} else if (err < 0) {
 				return NULL; /* I/O error */
 			}
 			/* err == 0: data was read successfully */
+#ifdef CONFIG_LBD_MISS_HANDLER
 		} else if (dev->miss_handler) {
 			/* No base, but miss handler registered */
 			return ERR_PTR(-ENODATA);
+#endif
 		} else {
 			memset(ce->data, 0, q->cluster_size);
 		}
@@ -818,6 +822,7 @@ void lbd_qcow2_destroy(struct lbd_device *dev)
 	q->l1_table = NULL;
 }
 
+#ifdef CONFIG_LBD_MISS_HANDLER
 /* ----------------------------------------------------------------
  * Miss handler support
  * ---------------------------------------------------------------- */
@@ -857,6 +862,7 @@ static void lbd_qcow2_invalidate_for_retry(struct lbd_device *dev,
 		}
 	}
 }
+#endif /* CONFIG_LBD_MISS_HANDLER */
 
 /* ----------------------------------------------------------------
  * Read path
@@ -882,12 +888,15 @@ int lbd_qcow2_read(struct lbd_device *dev, struct request *rq)
 			u32 bytes = min_t(u32, remaining,
 					  q->cluster_size - off_in_cluster);
 			struct lbd_cl_cache_entry *ce;
+#ifdef CONFIG_LBD_MISS_HANDLER
 			int retries = 0;
 
 retry_cluster:
+#endif
 			down_read(&q->rwsem);
 
 			ce = lbd_qcow2_cl_load(dev, cluster_idx);
+#ifdef CONFIG_LBD_MISS_HANDLER
 			if (IS_ERR(ce)) {
 				enum lbd_miss_action action;
 
@@ -905,6 +914,7 @@ retry_cluster:
 				memset(mapped + bv_off, 0, bytes);
 				goto next_chunk;
 			}
+#endif
 			if (!ce) {
 				/* Real I/O error */
 				up_read(&q->rwsem);
@@ -917,7 +927,9 @@ retry_cluster:
 
 			up_read(&q->rwsem);
 
+#ifdef CONFIG_LBD_MISS_HANDLER
 next_chunk:
+#endif
 			bv_off += bytes;
 			guest_offset += bytes;
 			remaining -= bytes;
