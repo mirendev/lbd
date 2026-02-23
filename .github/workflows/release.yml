@@ -1,0 +1,30 @@
+name: Release
+
+on:
+  push:
+  release:
+    types: [created]
+
+permissions:
+  contents: write
+
+jobs:
+  build-packages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rpmbuild
+        run: sudo apt-get update && sudo apt-get install -y rpm
+
+      - name: Build deb package
+        run: packaging/build-deb.sh
+
+      - name: Build rpm package
+        run: packaging/build-rpm.sh
+
+      - name: Upload release assets
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/*
