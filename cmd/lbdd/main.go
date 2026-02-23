@@ -26,7 +26,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
-	"github.com/evanphx/lbd/lbd"
+	"miren.dev/lbd"
 	"golang.org/x/sys/unix"
 	"miren.dev/mflags"
 	_ "modernc.org/sqlite"

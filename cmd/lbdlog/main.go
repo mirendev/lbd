@@ -22,7 +22,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/evanphx/lbd/lbd"
+	"miren.dev/lbd"
 	"miren.dev/mflags"
 	_ "modernc.org/sqlite"
 )

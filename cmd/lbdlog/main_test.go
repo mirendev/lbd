@@ -8,7 +8,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/evanphx/lbd/lbd"
+	"miren.dev/lbd"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

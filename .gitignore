@@ -4,15 +4,15 @@
 *.mod.c
 *.mod.o
 # Kernel .mod files but not go.mod
-lbd_mod.mod
+lbd.mod
 *.cmd
 modules.order
 Module.symvers
 
 # Built binaries
-lbdctl
-lbdlog/lbdlog
-lbdlog/cmd/lbdlog/lbdlog
+bin/
+dist/
+src/lbdctl
 
 # Test/data artifacts
 out2

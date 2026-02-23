@@ -1,4 +1,4 @@
-module github.com/evanphx/lbd/lbd
+module miren.dev/lbd
 
 go 1.25.1
 
