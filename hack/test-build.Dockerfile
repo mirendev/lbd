@@ -1,8 +1,11 @@
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
-ARG INSTALL_CMD
-RUN ${INSTALL_CMD}
+RUN if command -v apt-get >/dev/null; then \
+      apt-get update && apt-get install -y --no-install-recommends dkms build-essential linux-headers-generic; \
+    elif command -v dnf >/dev/null; then \
+      dnf install -y dkms gcc make kernel-devel; \
+    fi
 
 COPY src/ /usr/src/lbd-0.1.0/
 
