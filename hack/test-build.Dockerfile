@@ -4,7 +4,10 @@ FROM ${BASE_IMAGE}
 RUN if command -v apt-get >/dev/null; then \
       apt-get update && apt-get install -y --no-install-recommends dkms build-essential linux-headers-generic; \
     elif command -v dnf >/dev/null; then \
-      dnf install -y dkms gcc make kernel-devel; \
+      dnf install -y dkms gcc make kernel-devel && \
+      KVER=$(ls /usr/src/kernels/) && \
+      mkdir -p /lib/modules/$KVER && \
+      ln -s /usr/src/kernels/$KVER /lib/modules/$KVER/build; \
     fi
 
 COPY src/ /usr/src/lbd-0.1.0/
