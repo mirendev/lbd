@@ -34,3 +34,47 @@ jobs:
         with:
           name: lbd-dkms.rpm
           path: dist/*.rpm
+
+  build-module:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-22.04
+            image: ubuntu:22.04
+            install: "apt-get update && apt-get install -y --no-install-recommends dkms build-essential linux-headers-generic"
+          - name: ubuntu-24.04
+            image: ubuntu:24.04
+            install: "apt-get update && apt-get install -y --no-install-recommends dkms build-essential linux-headers-generic"
+          - name: ubuntu-25.10
+            image: ubuntu:25.10
+            install: "apt-get update && apt-get install -y --no-install-recommends dkms build-essential linux-headers-generic"
+          - name: fedora-40
+            image: fedora:40
+            install: "dnf install -y dkms gcc make kernel-devel"
+          - name: fedora-42
+            image: fedora:42
+            install: "dnf install -y dkms gcc make kernel-devel"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build module (${{ matrix.name }})
+        run: |
+          docker build \
+            --build-arg BASE_IMAGE=${{ matrix.image }} \
+            --build-arg "INSTALL_CMD=${{ matrix.install }}" \
+            -f hack/test-build.Dockerfile \
+            -t lbd-build .
+
+      - name: Extract .ko
+        run: |
+          docker create --name extract lbd-build
+          docker cp extract:/out/. out/
+          docker rm extract
+
+      - name: Upload .ko
+        uses: actions/upload-artifact@v4
+        with:
+          name: lbd-${{ matrix.name }}.ko
+          path: out/
