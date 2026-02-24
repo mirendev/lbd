@@ -23,8 +23,14 @@ jobs:
       - name: Build rpm package
         run: packaging/build-rpm.sh
 
-      - name: Upload artifacts
+      - name: Upload deb
         uses: actions/upload-artifact@v4
         with:
-          name: packages
-          path: dist/
+          name: lbd-dkms.deb
+          path: dist/*.deb
+
+      - name: Upload rpm
+        uses: actions/upload-artifact@v4
+        with:
+          name: lbd-dkms.rpm
+          path: dist/*.rpm
