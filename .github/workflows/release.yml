@@ -66,9 +66,10 @@ jobs:
           docker create --name extract lbd-build
           docker cp extract:/out/. out/
           docker rm extract
+          echo "KVER=$(cat out/KVER)" >> "$GITHUB_ENV"
 
       - name: Upload .ko
         uses: actions/upload-artifact@v4
         with:
-          name: lbd-${{ matrix.name }}.ko
-          path: out/
+          name: lbd-${{ matrix.name }}-${{ env.KVER }}.ko
+          path: out/lbd.ko*
