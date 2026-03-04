@@ -3,11 +3,10 @@
  * lbdctl - userspace control tool for LBD (Logging Block Device)
  *
  * Usage:
- *   lbdctl add --log-dir /path/to/logs /path/to/file.img - create a new lbd device
- *   lbdctl remove N                    - destroy /dev/lbdN
- *   lbdctl list                        - show all active devices
- *   lbdctl log /path/to/file.img.log   - dump log (human-readable)
- *   lbdctl log --json /path/to/file.img.log  - dump log as JSON
+ *   lbdctl add [--json] --log-dir /path/to/logs /path/to/file.img
+ *   lbdctl remove [--json] N           - destroy /dev/lbdN
+ *   lbdctl list [--json]               - show all active devices
+ *   lbdctl log [--json] /path/to/file.img.log  - dump log
  */
 
 #include <errno.h>
@@ -268,11 +267,14 @@ static int cmd_add(int argc, char **argv)
 	const char *log_dir = NULL;
 	const char *base = NULL;
 	int fd, ret;
+	int json = 0;
 
 	memset(&arg, 0, sizeof(arg));
 
 	for (int i = 0; i < argc; i++) {
-		if (strcmp(argv[i], "--log-max-size") == 0) {
+		if (strcmp(argv[i], "--json") == 0) {
+			json = 1;
+		} else if (strcmp(argv[i], "--log-max-size") == 0) {
 			if (++i >= argc) {
 				fprintf(stderr, "--log-max-size requires a value\n");
 				return 1;
@@ -368,15 +370,38 @@ static int cmd_add(int argc, char **argv)
 		return 1;
 	}
 
-	printf("Created /dev/lbd%d\n", arg.index);
+	if (json) {
+		printf("{\"device\": \"/dev/lbd%d\", \"index\": %d}\n",
+		       arg.index, arg.index);
+	} else {
+		printf("Created /dev/lbd%d\n", arg.index);
+	}
 	close(fd);
 	return 0;
 }
 
-static int cmd_remove(const char *index_str)
+static int cmd_remove(int argc, char **argv)
 {
 	struct lbd_ctl_remove arg;
 	int fd, ret;
+	int json = 0;
+	const char *index_str = NULL;
+
+	for (int i = 0; i < argc; i++) {
+		if (strcmp(argv[i], "--json") == 0)
+			json = 1;
+		else if (!index_str)
+			index_str = argv[i];
+		else {
+			fprintf(stderr, "Unexpected argument: %s\n", argv[i]);
+			return 1;
+		}
+	}
+
+	if (!index_str) {
+		fprintf(stderr, "remove requires an index argument\n");
+		return 1;
+	}
 
 	arg.index = atoi(index_str);
 
@@ -391,22 +416,41 @@ static int cmd_remove(const char *index_str)
 		return 1;
 	}
 
-	printf("Removed /dev/lbd%d\n", arg.index);
+	if (json) {
+		printf("{\"device\": \"/dev/lbd%d\", \"index\": %d}\n",
+		       arg.index, arg.index);
+	} else {
+		printf("Removed /dev/lbd%d\n", arg.index);
+	}
 	close(fd);
 	return 0;
 }
 
-static int cmd_list(void)
+static int cmd_list(int argc, char **argv)
 {
 	struct lbd_ctl_info info;
 	int fd, i, found = 0;
+	int json = 0;
+
+	for (i = 0; i < argc; i++) {
+		if (strcmp(argv[i], "--json") == 0)
+			json = 1;
+		else {
+			fprintf(stderr, "Unexpected argument: %s\n", argv[i]);
+			return 1;
+		}
+	}
 
 	fd = open_ctl();
 	if (fd < 0)
 		return 1;
 
-	printf("%-8s %-10s %-12s %s\n", "DEVICE", "STATE", "SIZE", "BACKING");
-	printf("%-8s %-10s %-12s %s\n", "------", "-----", "----", "-------");
+	if (json) {
+		printf("[");
+	} else {
+		printf("%-8s %-10s %-12s %s\n", "DEVICE", "STATE", "SIZE", "BACKING");
+		printf("%-8s %-10s %-12s %s\n", "------", "-----", "----", "-------");
+	}
 
 	for (i = 0; i < 256; i++) {
 		memset(&info, 0, sizeof(info));
@@ -415,14 +459,27 @@ static int cmd_list(void)
 		if (ioctl(fd, LBD_CTL_INFO, &info) < 0)
 			continue;
 
-		printf("lbd%-5d %-10s %-12llu %s\n",
-		       info.index, state_str(info.state),
-		       (unsigned long long)info.size, info.path);
+		if (json) {
+			if (found > 0)
+				printf(",");
+			printf("\n  {\"device\": \"/dev/lbd%d\", \"index\": %d, \"state\": \"%s\", \"size\": %llu, \"backing\": ",
+			       info.index, info.index, state_str(info.state),
+			       (unsigned long long)info.size);
+			json_print_string(stdout, info.path);
+			printf("}");
+		} else {
+			printf("lbd%-5d %-10s %-12llu %s\n",
+			       info.index, state_str(info.state),
+			       (unsigned long long)info.size, info.path);
+		}
 		found++;
 	}
 
-	if (!found)
+	if (json) {
+		printf("\n]\n");
+	} else if (!found) {
 		printf("(no devices)\n");
+	}
 
 	close(fd);
 	return 0;
@@ -2678,9 +2735,12 @@ static int cmd_swap(int argc, char **argv)
 	int dev_index = -1;
 	const char *path = NULL;
 	char resolved[PATH_MAX];
+	int json = 0;
 
 	for (int i = 0; i < argc; i++) {
-		if (strcmp(argv[i], "--dev") == 0) {
+		if (strcmp(argv[i], "--json") == 0) {
+			json = 1;
+		} else if (strcmp(argv[i], "--dev") == 0) {
 			if (++i >= argc) {
 				fprintf(stderr, "--dev requires a value\n");
 				return 1;
@@ -2730,7 +2790,14 @@ static int cmd_swap(int argc, char **argv)
 		return 1;
 	}
 
-	printf("Swapped base layer for lbd%d to %s\n", dev_index, resolved);
+	if (json) {
+		printf("{\"device\": \"/dev/lbd%d\", \"index\": %d, \"base\": ",
+		       dev_index, dev_index);
+		json_print_string(stdout, resolved);
+		printf("}\n");
+	} else {
+		printf("Swapped base layer for lbd%d to %s\n", dev_index, resolved);
+	}
 	close(fd);
 	return 0;
 }
@@ -2754,6 +2821,9 @@ static void usage(void)
 		"  lbdctl convert <flat> <qcow2>      Convert flat image to qcow2-lz4\n"
 		"  lbdctl extract <qcow2> <flat>      Extract qcow2-lz4 to flat image\n"
 		"  lbdctl compact <qcow2>             Compact qcow2-lz4 image (reclaim space)\n"
+		"\n"
+		"Global options:\n"
+		"  --json                   Output as JSON\n"
 		"\n"
 		"Add options:\n"
 		"  --log-dir <dir>          Directory to write log files (required)\n"
@@ -2797,15 +2867,11 @@ int main(int argc, char **argv)
 	}
 
 	if (strcmp(argv[1], "remove") == 0) {
-		if (argc < 3) {
-			fprintf(stderr, "remove requires an index argument\n");
-			return 1;
-		}
-		return cmd_remove(argv[2]);
+		return cmd_remove(argc - 2, argv + 2);
 	}
 
 	if (strcmp(argv[1], "list") == 0) {
-		return cmd_list();
+		return cmd_list(argc - 2, argv + 2);
 	}
 
 	if (strcmp(argv[1], "watch") == 0) {
