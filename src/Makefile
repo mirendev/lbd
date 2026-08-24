@@ -3,7 +3,13 @@ ifneq ($(KERNELRELEASE),)
 obj-m := lbd.o
 lbd-y := lbd_main.o lbd_qcow2.o lz4/lz4.o
 
-ccflags-y := -include $(M)/lz4_kcompat.h
+# Newer kernels re-add explicit old_parent/new_parent dentry fields to
+# struct renamedata, which vfs_rename() dereferences directly. Distro version
+# numbers don't reliably mark when this landed, so probe the headers for the
+# field and let lbd_rename_file() populate the parents when it is present.
+LBD_RENAME_PARENT := $(shell grep -qs 'old_parent' $(srctree)/include/linux/fs.h && echo 1 || echo 0)
+
+ccflags-y := -include $(M)/lz4_kcompat.h -DLBD_HAS_RENAME_PARENT=$(LBD_RENAME_PARENT)
 CFLAGS_lz4/lz4.o := -Wno-deprecated-declarations -Wframe-larger-than=32768
 
 else

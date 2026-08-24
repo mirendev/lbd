@@ -247,4 +247,15 @@ struct lbd_device {
 #define LBD_HAS_RENAME_SINGLE_IDMAP 0
 #endif
 
+/* Newer kernels re-add explicit old_parent/new_parent dentry fields to
+ * struct renamedata; vfs_rename() then dereferences them instead of deriving
+ * the parents from the dentries, so they must be populated or the rename
+ * faults on a NULL parent. The exact version varies by distro (the field was
+ * seen on a 7.0.x tree), so src/Makefile probes the kernel headers for the
+ * member and defines LBD_HAS_RENAME_PARENT; default off when unprobed (e.g.
+ * the userspace lbdctl build, which never renames through the VFS). */
+#ifndef LBD_HAS_RENAME_PARENT
+#define LBD_HAS_RENAME_PARENT 0
+#endif
+
 #endif /* _LBD_H */

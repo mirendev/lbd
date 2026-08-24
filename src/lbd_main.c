@@ -663,7 +663,13 @@ static int lbd_rename_file(struct file *old_file, const char *new_basename)
 	}
 
 	memset(&rd, 0, sizeof(rd));
-#if LBD_HAS_RENAME_SINGLE_IDMAP
+#if LBD_HAS_RENAME_PARENT
+	rd.mnt_idmap = &nop_mnt_idmap;
+	rd.old_parent = parent;
+	rd.old_dentry = old_dentry;
+	rd.new_parent = parent;
+	rd.new_dentry = new_dentry;
+#elif LBD_HAS_RENAME_SINGLE_IDMAP
 	rd.mnt_idmap = &nop_mnt_idmap;
 	rd.old_dentry = old_dentry;
 	rd.new_dentry = new_dentry;
