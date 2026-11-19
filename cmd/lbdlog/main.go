@@ -11,9 +11,9 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
-	"hash/crc32"
 	"encoding/hex"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -275,25 +275,33 @@ func runReplay(cfg *replayArgs) error {
 		}
 	}
 
-	// Read first header for device metadata
-	firstRC, err := logs[0].Open()
-	if err != nil {
-		return fmt.Errorf("opening first log file: %w", err)
+	// A header-only segment can record growth. Scan all headers before
+	// creating output, especially qcow2 whose L1 table depends on capacity.
+	var deviceSize uint64
+	var blockSize uint32
+	for _, log := range logs {
+		rc, err := log.Open()
+		if err != nil {
+			return fmt.Errorf("opening %s: %w", log.Name, err)
+		}
+		rd, err := lbd.NewReader(rc)
+		rc.Close()
+		if err != nil {
+			return fmt.Errorf("reading header from %s: %w", log.Name, err)
+		}
+		if blockSize != 0 && blockSize != rd.Header.BlockSize {
+			return fmt.Errorf("inconsistent block size in %s", log.Name)
+		}
+		blockSize = rd.Header.BlockSize
+		if rd.Header.DeviceSize > deviceSize {
+			deviceSize = rd.Header.DeviceSize
+		}
 	}
-
-	firstRd, err := lbd.NewReader(firstRC)
-	if err != nil {
-		firstRC.Close()
-		return fmt.Errorf("reading header from %s: %w", logs[0].Name, err)
-	}
-
-	deviceSize := firstRd.Header.DeviceSize
-	blockSize := firstRd.Header.BlockSize
-	firstRC.Close()
 
 	incremental := lastReplayedLabel != ""
 
 	// Create output and replay
+	var err error
 	if cfg.QCow2 {
 		err = replayToQCow2(logs, outputPath, deviceSize, blockSize, incremental)
 	} else {
@@ -335,6 +343,18 @@ func replayToFlat(logs []logSource, outputPath string, deviceSize uint64, blockS
 		}
 	}
 	defer outFile.Close()
+
+	// Incremental replay must grow even when the only new segment is a
+	// size boundary, and must never shrink an already larger output.
+	st, err := outFile.Stat()
+	if err != nil {
+		return err
+	}
+	if deviceSize > uint64(st.Size()) {
+		if err := outFile.Truncate(int64(deviceSize)); err != nil {
+			return fmt.Errorf("growing output file: %w", err)
+		}
+	}
 
 	var totalEntries, totalWrites, totalTrims, crcErrors int
 	var totalBytes uint64
@@ -396,6 +416,11 @@ func replayToFlat(logs []logSource, outputPath string, deviceSize uint64, blockS
 		f.Close()
 	}
 
+	// Persist header-only growth before runReplay advances its checkpoint.
+	if err := outFile.Sync(); err != nil {
+		return fmt.Errorf("syncing replay output: %w", err)
+	}
+
 	fmt.Printf("Replayed %d entries (%d writes, %d trims) from %d segments\n",
 		totalEntries, totalWrites, totalTrims, len(logs))
 	fmt.Printf("Output: %s (%s)\n", outputPath, fmtSize(deviceSize))
@@ -412,6 +437,10 @@ func replayToQCow2(logs []logSource, outputPath string, deviceSize uint64, block
 		img, err = lbd.OpenQCow2(outputPath)
 		if err != nil {
 			return fmt.Errorf("opening qcow2 image for incremental replay: %w", err)
+		}
+		if deviceSize > img.VirtualSize {
+			img.Close()
+			return fmt.Errorf("incremental qcow2 growth is unsupported; replay all segments to a new image")
 		}
 	} else {
 		img, err = lbd.CreateQCow2(outputPath, deviceSize, 16)
@@ -581,6 +610,10 @@ func runRepack(cfg *repackArgs) error {
 			return fmt.Errorf("reading header from %s: %w", logID, err)
 		}
 
+		if rd.Header.DeviceSize > outHdr.DeviceSize {
+			outHdr.DeviceSize = rd.Header.DeviceSize
+		}
+
 		for {
 			e, err := rd.Next()
 			if err == io.EOF {
@@ -739,14 +772,14 @@ func runScan(cfg *scanArgs) error {
 }
 
 type gcArgs struct {
-	Threshold  int `long:"threshold" usage:"utilization threshold percentage (0-100) below which segments are retired" default:"50"`
-	DryRun     bool    `long:"dry-run" usage:"show utilization without retiring segments"`
-	LogDir     string  `position:"0" usage:"directory containing log segment files"`
-	VolName    string  `long:"vol-name" usage:"volume name for S3 key prefix"`
-	S3Bucket   string  `long:"s3-bucket" usage:"S3 bucket for log storage"`
-	S3Prefix   string  `long:"s3-prefix" usage:"S3 key prefix"`
-	S3Endpoint string  `long:"s3-endpoint" usage:"S3-compatible endpoint URL"`
-	S3Region   string  `long:"s3-region" usage:"AWS region for S3"`
+	Threshold  int    `long:"threshold" usage:"utilization threshold percentage (0-100) below which segments are retired" default:"50"`
+	DryRun     bool   `long:"dry-run" usage:"show utilization without retiring segments"`
+	LogDir     string `position:"0" usage:"directory containing log segment files"`
+	VolName    string `long:"vol-name" usage:"volume name for S3 key prefix"`
+	S3Bucket   string `long:"s3-bucket" usage:"S3 bucket for log storage"`
+	S3Prefix   string `long:"s3-prefix" usage:"S3 key prefix"`
+	S3Endpoint string `long:"s3-endpoint" usage:"S3-compatible endpoint URL"`
+	S3Region   string `long:"s3-region" usage:"AWS region for S3"`
 }
 
 func runGC(cfg *gcArgs) error {

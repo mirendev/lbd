@@ -133,7 +133,7 @@ func DiscoverLogFiles(dir string) ([]string, error) {
 type GCConfig struct {
 	LogDir    string   // directory containing log segment files (used when Store is nil)
 	Store     LogStore // if non-nil, used instead of LogDir for all I/O
-	Threshold int // utilization threshold as a percentage (0-100); segments below this are retired
+	Threshold int      // utilization threshold as a percentage (0-100); segments below this are retired
 	DryRun    bool     // if true, analyze only without retiring
 }
 
@@ -221,18 +221,28 @@ func RunGC(ctx context.Context, cfg GCConfig) (*GCResult, error) {
 		logsToProcess = logFiles
 	}
 
-	// Read first header for device metadata (needed for retirement output).
-	rc, err := store.Open(ctx, logFiles[0])
-	if err != nil {
-		return nil, fmt.Errorf("opening %s: %w", logFiles[0], err)
-	}
-	firstRd, err := NewReader(rc)
-	if err != nil {
+	// Include old and header-only segments on incremental runs too: a
+	// replacement must not regress capacity when newer segments are retired.
+	var firstHeader Header
+	headerSizes := make(map[string]uint64, len(logFiles))
+	for i, logID := range logFiles {
+		rc, err := store.Open(ctx, logID)
+		if err != nil {
+			return nil, fmt.Errorf("opening %s: %w", logID, err)
+		}
+		rd, err := NewReader(rc)
 		rc.Close()
-		return nil, fmt.Errorf("reading header from %s: %w", logFiles[0], err)
+		if err != nil {
+			return nil, fmt.Errorf("reading header from %s: %w", logID, err)
+		}
+		if i == 0 {
+			firstHeader = rd.Header
+		}
+		if rd.Header.DeviceSize > firstHeader.DeviceSize {
+			firstHeader.DeviceSize = rd.Header.DeviceSize
+		}
+		headerSizes[logID] = rd.Header.DeviceSize
 	}
-	firstHeader := firstRd.Header
-	rc.Close()
 
 	if lm == nil {
 		lm = NewLiveMap(firstHeader.BlockSize)
@@ -321,8 +331,18 @@ func RunGC(ctx context.Context, cfg GCConfig) (*GCResult, error) {
 		}
 	}
 
-	if !hasLive {
-		// No live data — just delete retired segments.
+	// Even a fully shadowed segment may be the only record of growth.
+	for _, ri := range result.RetireIndexes {
+		delete(headerSizes, stats[ri].Path)
+	}
+	sizePreserved := false
+	for _, size := range headerSizes {
+		if size == firstHeader.DeviceSize {
+			sizePreserved = true
+		}
+	}
+	if !hasLive && sizePreserved {
+		// No live data or unique capacity metadata to copy.
 		for _, ri := range result.RetireIndexes {
 			if err := store.Delete(ctx, stats[ri].Path); err != nil {
 				return nil, fmt.Errorf("removing %s: %w", stats[ri].Path, err)
