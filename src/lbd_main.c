@@ -17,6 +17,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/ktime.h>
 #include <linux/namei.h>
@@ -174,7 +175,7 @@ static const struct attribute_group lbd_attr_group;
 
 /* Forward declarations for log segmentation */
 static int lbd_open_log_file(struct lbd_device *dev);
-static int lbd_rotate_segment(struct lbd_device *dev);
+static int lbd_rotate_segment(struct lbd_device *dev, bool sync_dir);
 static void lbd_maybe_rotate_segment(struct lbd_device *dev);
 static void lbd_notify_watchers(struct lbd_device *dev);
 
@@ -497,7 +498,7 @@ static void lbd_handle_request(struct lbd_device *dev, struct request *rq)
 		if (!ret) {
 			mutex_lock(&dev->log_mutex);
 			if (dev->log_has_entries)
-				lbd_rotate_segment(dev);
+				lbd_rotate_segment(dev, false);
 			mutex_unlock(&dev->log_mutex);
 		}
 		break;
@@ -749,7 +750,7 @@ static void lbd_begin_segment(struct lbd_device *dev, u64 size)
 	lbd_write_log_header(dev);
 }
 
-static int lbd_rotate_segment(struct lbd_device *dev)
+static int lbd_rotate_segment(struct lbd_device *dev, bool sync_dir)
 {
 	char final_name[48];
 	struct file *dir;
@@ -774,13 +775,16 @@ static int lbd_rotate_segment(struct lbd_device *dev)
 	if (ret)
 		return ret;
 
-	/* A resize header must survive a crash even with no subsequent writes. */
-	dir = file_open_root(&dev->log_dir_path, ".", O_RDONLY | O_DIRECTORY, 0);
-	if (IS_ERR(dir)) {
-		ret = PTR_ERR(dir);
-	} else {
-		ret = vfs_fsync(dir, 0);
-		fput(dir);
+	/* A resize header must survive a crash even with no subsequent writes.
+	 * Ordinary flush rotations skip this to keep the flush path cheap. */
+	if (sync_dir) {
+		dir = file_open_root(&dev->log_dir_path, ".", O_RDONLY | O_DIRECTORY, 0);
+		if (IS_ERR(dir)) {
+			ret = PTR_ERR(dir);
+		} else {
+			ret = vfs_fsync(dir, 0);
+			fput(dir);
+		}
 	}
 
 	/* Once renamed, the segment is immutable even if directory fsync fails.
@@ -811,7 +815,7 @@ static void lbd_log_rotate_work_fn(struct work_struct *work)
 
 	mutex_lock(&dev->log_mutex);
 	if (dev->log_has_entries)
-		lbd_rotate_segment(dev);
+		lbd_rotate_segment(dev, false);
 	mutex_unlock(&dev->log_mutex);
 }
 
@@ -821,7 +825,7 @@ static void lbd_maybe_rotate_segment(struct lbd_device *dev)
 		i_size_read(file_inode(dev->log_file)) : 0;
 
 	if (file_size + dev->log_buf_used >= (loff_t)dev->log_max_size)
-		lbd_rotate_segment(dev);
+		lbd_rotate_segment(dev, false);
 }
 
 static void lbd_finalize_log(struct lbd_device *dev)
@@ -1192,6 +1196,28 @@ static int lbd_remove_device(struct lbd_ctl_remove __user *uarg)
 	return 0;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+static unsigned int lbd_freeze_queue(struct request_queue *q)
+{
+#if LBD_HAS_FREEZE_MEMFLAGS
+	return blk_mq_freeze_queue(q);
+#else
+	blk_mq_freeze_queue(q);
+	return memalloc_noio_save();
+#endif
+}
+
+static void lbd_unfreeze_queue(struct request_queue *q, unsigned int memflags)
+{
+#if LBD_HAS_FREEZE_MEMFLAGS
+	blk_mq_unfreeze_queue(q, memflags);
+#else
+	memalloc_noio_restore(memflags);
+	blk_mq_unfreeze_queue(q);
+#endif
+}
+#endif
+
 static int lbd_resize_device(struct lbd_ctl_resize __user *uarg)
 {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
@@ -1204,6 +1230,7 @@ static int lbd_resize_device(struct lbd_ctl_resize __user *uarg)
 	loff_t old_size, image_size;
 	loff_t pos = 0;
 	__be32 magic;
+	unsigned int memflags;
 	int ret = 0;
 
 	if (copy_from_user(&arg, uarg, sizeof(arg)))
@@ -1255,7 +1282,7 @@ static int lbd_resize_device(struct lbd_ctl_resize __user *uarg)
 
 	/* Freeze drains requests, not merely dispatch: workers must finish before
 	 * taking log_mutex. Mounted users may remain open throughout. */
-	blk_mq_freeze_queue(dev->gd->queue);
+	memflags = lbd_freeze_queue(dev->gd->queue);
 	mutex_lock(&dev->log_mutex);
 	if (image_size < arg.size)
 		ret = vfs_truncate(&dev->backing_file->f_path, arg.size);
@@ -1264,7 +1291,7 @@ static int lbd_resize_device(struct lbd_ctl_resize __user *uarg)
 	if (ret)
 		goto unfreeze;
 
-	ret = lbd_rotate_segment(dev);
+	ret = lbd_rotate_segment(dev, true);
 	if (ret)
 		goto unfreeze;
 	/* Publish a durable header-only segment before exposing capacity. Keep
@@ -1273,7 +1300,7 @@ static int lbd_resize_device(struct lbd_ctl_resize __user *uarg)
 	 * adopted the new size without ever recording a durable boundary. */
 	lbd_begin_segment(dev, arg.size);
 	dev->log_has_entries = true;
-	ret = lbd_rotate_segment(dev);
+	ret = lbd_rotate_segment(dev, true);
 	if (ret)
 		goto unfreeze;
 	WRITE_ONCE(dev->size, arg.size);
@@ -1281,7 +1308,7 @@ static int lbd_resize_device(struct lbd_ctl_resize __user *uarg)
 	set_capacity_and_notify(dev->gd, arg.size >> SECTOR_SHIFT);
 unfreeze:
 	mutex_unlock(&dev->log_mutex);
-	blk_mq_unfreeze_queue(dev->gd->queue);
+	lbd_unfreeze_queue(dev->gd->queue, memflags);
 out:
 	mutex_unlock(&lbd_devices_mutex);
 	fput(expected);

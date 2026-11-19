@@ -250,6 +250,17 @@ struct lbd_device {
 
 /* 6.18+: struct renamedata uses single mnt_idmap field
  *        (replaces old_mnt_idmap/new_mnt_idmap) */
+/*
+ * 6.14: blk_mq_freeze_queue() returns memalloc flags that unfreeze restores,
+ * so allocations while frozen cannot recurse into I/O on the frozen device.
+ * Older kernels get the same protection from memalloc_noio_save().
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
+#define LBD_HAS_FREEZE_MEMFLAGS 1
+#else
+#define LBD_HAS_FREEZE_MEMFLAGS 0
+#endif
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
 #define LBD_HAS_RENAME_SINGLE_IDMAP 1
 #else
