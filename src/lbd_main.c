@@ -215,17 +215,30 @@ static int lbd_log_flush(struct lbd_device *dev)
 	return 0;
 }
 
-static int lbd_log_buf_append(struct lbd_device *dev,
-			      const void *data, size_t len)
+/*
+ * Make room for a whole record before appending any of it. A failed flush
+ * keeps the buffer, so flushing between a record's parts would leave a torn
+ * record that makes the rest of the segment unparseable.
+ */
+static int lbd_log_buf_reserve(struct lbd_device *dev, size_t len)
 {
-	if (dev->log_buf_used + len > LBD_LOG_BUF_SIZE) {
-		int ret = lbd_log_flush(dev);
-		if (ret)
-			return ret;
-	}
+	int ret;
+
+	if (len > LBD_LOG_BUF_SIZE)
+		return -E2BIG;
+	if (dev->log_buf_used + len <= LBD_LOG_BUF_SIZE)
+		return 0;
+	ret = lbd_log_flush(dev);
+	if (ret)
+		return ret;
+	/* A partial flush can leave too little room. */
+	return dev->log_buf_used + len > LBD_LOG_BUF_SIZE ? -EIO : 0;
+}
+
+static void lbd_log_buf_put(struct lbd_device *dev, const void *data, size_t len)
+{
 	memcpy(dev->log_buf + dev->log_buf_used, data, len);
 	dev->log_buf_used += len;
-	return 0;
 }
 
 /* ----------------------------------------------------------------
@@ -326,13 +339,13 @@ static void lbd_log_write(struct lbd_device *dev, struct request *rq)
 		goto warn;
 	}
 
-	ret = lbd_log_buf_append(dev, tmp, cbor_enc_len(&e));
-	if (ret)
+	ret = lbd_log_buf_reserve(dev, cbor_enc_len(&e) + comp_len);
+	if (ret) {
+		dev->log_seq--;
 		goto warn;
-
-	ret = lbd_log_buf_append(dev, comp_buf, comp_len);
-	if (ret)
-		goto warn;
+	}
+	lbd_log_buf_put(dev, tmp, cbor_enc_len(&e));
+	lbd_log_buf_put(dev, comp_buf, comp_len);
 
 	dev->log_has_entries = true;
 	lbd_maybe_rotate_segment(dev);
@@ -430,9 +443,12 @@ static void lbd_log_discard(struct lbd_device *dev, struct request *rq)
 		goto warn;
 	}
 
-	ret = lbd_log_buf_append(dev, tmp, cbor_enc_len(&e));
-	if (ret)
+	ret = lbd_log_buf_reserve(dev, cbor_enc_len(&e));
+	if (ret) {
+		dev->log_seq--;
 		goto warn;
+	}
+	lbd_log_buf_put(dev, tmp, cbor_enc_len(&e));
 
 	dev->log_has_entries = true;
 	lbd_maybe_rotate_segment(dev);
@@ -582,6 +598,7 @@ static int lbd_write_log_header(struct lbd_device *dev)
 	u8 tmp[512];
 	struct cbor_enc e;
 	size_t path_len = strlen(dev->backing_path);
+	int ret;
 
 	cbor_enc_init(&e, tmp, sizeof(tmp));
 
@@ -606,7 +623,11 @@ static int lbd_write_log_header(struct lbd_device *dev)
 	if (e.err)
 		return e.err;
 
-	return lbd_log_buf_append(dev, tmp, cbor_enc_len(&e));
+	ret = lbd_log_buf_reserve(dev, cbor_enc_len(&e));
+	if (ret)
+		return ret;
+	lbd_log_buf_put(dev, tmp, cbor_enc_len(&e));
+	return 0;
 }
 
 /* ----------------------------------------------------------------

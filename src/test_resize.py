@@ -197,8 +197,43 @@ def main():
             run(CTL, "create", "--size", "64M", qcow)
             qi, _ = attach(qcow, tmp / "qcow-logs")
             resize(qi, qcow, 128 * MIB, errno.EOPNOTSUPP)
+            # A log flush that fails with a nearly full buffer must not leave a
+            # torn record: once the log recovers, every segment must still parse.
+            torn_logs = tmp / "torn-logs"
+            torn_logs.mkdir()
+            run("mount", "--bind", torn_logs, torn_logs)
+            log_mount = torn_logs
+            torn = tmp / "torn.img"
+            with open(torn, "wb") as f:
+                f.truncate(64 * MIB)
+            run("mount", "-o", "remount,bind,ro", torn_logs)
+            ti, tnode = attach(torn, torn_logs)
+            fd = os.open(tnode, os.O_WRONLY)
+            try:
+                # Random data defeats LZ4, so records overflow the 5 MiB buffer
+                # while every flush fails.
+                for i in range(12):
+                    os.pwrite(fd, os.urandom(MIB), i * MIB)
+                    try:
+                        os.fsync(fd)
+                    except OSError:
+                        pass
+                run("mount", "-o", "remount,bind,rw", torn_logs)
+                os.pwrite(fd, os.urandom(MIB), 20 * MIB)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            run(CTL, "remove", ti)
+            devices.remove(ti)
+            run("umount", torn_logs)
+            log_mount = None
+            segments = sorted(torn_logs.glob("*.log"))
+            assert segments, "no segment written after the log recovered"
+            run(LOG, "show", *segments)
+
             print("PASS: identity, shrink/alignment, live fd, no-write recovery, tail replay,")
-            print("      interrupted growth, mounted ext4 I/O, log failure retry, recycled index, qcow rejection")
+            print("      interrupted growth, mounted ext4 I/O, log failure retry, recycled index, qcow rejection,")
+            print("      no torn records after failed flushes")
         finally:
             if mounted:
                 run("umount", mount)
