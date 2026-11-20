@@ -17,6 +17,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/ktime.h>
 #include <linux/namei.h>
@@ -174,7 +175,7 @@ static const struct attribute_group lbd_attr_group;
 
 /* Forward declarations for log segmentation */
 static int lbd_open_log_file(struct lbd_device *dev);
-static void lbd_rotate_segment(struct lbd_device *dev);
+static int lbd_rotate_segment(struct lbd_device *dev, bool sync_dir);
 static void lbd_maybe_rotate_segment(struct lbd_device *dev);
 static void lbd_notify_watchers(struct lbd_device *dev);
 
@@ -193,10 +194,8 @@ static int lbd_log_flush(struct lbd_device *dev)
 	/* Lazy-open: create the segment file on first flush */
 	if (!dev->log_file) {
 		int err = lbd_open_log_file(dev);
-		if (err) {
-			dev->log_buf_used = 0;
+		if (err)
 			return err;
-		}
 	}
 
 	pos = i_size_read(file_inode(dev->log_file));
@@ -205,24 +204,41 @@ static int lbd_log_flush(struct lbd_device *dev)
 	if (ret != dev->log_buf_used) {
 		pr_warn_ratelimited("lbd%d: log flush failed (%zd)\n",
 				    dev->index, ret);
-		dev->log_buf_used = 0;
+		if (ret > 0) {
+			dev->log_buf_used -= ret;
+			memmove(dev->log_buf, dev->log_buf + ret,
+				dev->log_buf_used);
+		}
 		return ret < 0 ? ret : -EIO;
 	}
 	dev->log_buf_used = 0;
 	return 0;
 }
 
-static int lbd_log_buf_append(struct lbd_device *dev,
-			      const void *data, size_t len)
+/*
+ * Make room for a whole record before appending any of it. A failed flush
+ * keeps the buffer, so flushing between a record's parts would leave a torn
+ * record that makes the rest of the segment unparseable.
+ */
+static int lbd_log_buf_reserve(struct lbd_device *dev, size_t len)
 {
-	if (dev->log_buf_used + len > LBD_LOG_BUF_SIZE) {
-		int ret = lbd_log_flush(dev);
-		if (ret)
-			return ret;
-	}
+	int ret;
+
+	if (len > LBD_LOG_BUF_SIZE)
+		return -E2BIG;
+	if (dev->log_buf_used + len <= LBD_LOG_BUF_SIZE)
+		return 0;
+	ret = lbd_log_flush(dev);
+	if (ret)
+		return ret;
+	/* A partial flush can leave too little room. */
+	return dev->log_buf_used + len > LBD_LOG_BUF_SIZE ? -EIO : 0;
+}
+
+static void lbd_log_buf_put(struct lbd_device *dev, const void *data, size_t len)
+{
 	memcpy(dev->log_buf + dev->log_buf_used, data, len);
 	dev->log_buf_used += len;
-	return 0;
 }
 
 /* ----------------------------------------------------------------
@@ -323,13 +339,13 @@ static void lbd_log_write(struct lbd_device *dev, struct request *rq)
 		goto warn;
 	}
 
-	ret = lbd_log_buf_append(dev, tmp, cbor_enc_len(&e));
-	if (ret)
+	ret = lbd_log_buf_reserve(dev, cbor_enc_len(&e) + comp_len);
+	if (ret) {
+		dev->log_seq--;
 		goto warn;
-
-	ret = lbd_log_buf_append(dev, comp_buf, comp_len);
-	if (ret)
-		goto warn;
+	}
+	lbd_log_buf_put(dev, tmp, cbor_enc_len(&e));
+	lbd_log_buf_put(dev, comp_buf, comp_len);
 
 	dev->log_has_entries = true;
 	lbd_maybe_rotate_segment(dev);
@@ -427,9 +443,12 @@ static void lbd_log_discard(struct lbd_device *dev, struct request *rq)
 		goto warn;
 	}
 
-	ret = lbd_log_buf_append(dev, tmp, cbor_enc_len(&e));
-	if (ret)
+	ret = lbd_log_buf_reserve(dev, cbor_enc_len(&e));
+	if (ret) {
+		dev->log_seq--;
 		goto warn;
+	}
+	lbd_log_buf_put(dev, tmp, cbor_enc_len(&e));
 
 	dev->log_has_entries = true;
 	lbd_maybe_rotate_segment(dev);
@@ -495,7 +514,7 @@ static void lbd_handle_request(struct lbd_device *dev, struct request *rq)
 		if (!ret) {
 			mutex_lock(&dev->log_mutex);
 			if (dev->log_has_entries)
-				lbd_rotate_segment(dev);
+				lbd_rotate_segment(dev, false);
 			mutex_unlock(&dev->log_mutex);
 		}
 		break;
@@ -579,6 +598,7 @@ static int lbd_write_log_header(struct lbd_device *dev)
 	u8 tmp[512];
 	struct cbor_enc e;
 	size_t path_len = strlen(dev->backing_path);
+	int ret;
 
 	cbor_enc_init(&e, tmp, sizeof(tmp));
 
@@ -595,7 +615,7 @@ static int lbd_write_log_header(struct lbd_device *dev)
 		      strlen(dev->log_segment_label));
 
 	cbor_enc_uint(&e, LBD_CBOR_KEY_HDR_DEVICE_SIZE);
-	cbor_enc_uint(&e, dev->size);
+	cbor_enc_uint(&e, dev->log_device_size);
 
 	cbor_enc_uint(&e, LBD_CBOR_KEY_HDR_BACKING_PATH);
 	cbor_enc_text(&e, dev->backing_path, path_len);
@@ -603,7 +623,11 @@ static int lbd_write_log_header(struct lbd_device *dev)
 	if (e.err)
 		return e.err;
 
-	return lbd_log_buf_append(dev, tmp, cbor_enc_len(&e));
+	ret = lbd_log_buf_reserve(dev, cbor_enc_len(&e));
+	if (ret)
+		return ret;
+	lbd_log_buf_put(dev, tmp, cbor_enc_len(&e));
+	return 0;
 }
 
 /* ----------------------------------------------------------------
@@ -722,8 +746,9 @@ static int lbd_open_log_file(struct lbd_device *dev)
 	f = file_open_root(&dev->log_dir_path, name,
 			   O_RDWR | O_CREAT | O_TRUNC | O_LARGEFILE, 0600);
 	if (IS_ERR(f)) {
-		pr_warn("lbd%d: cannot open %s: %ld\n",
-			dev->index, name, PTR_ERR(f));
+		/* A failed flush keeps the buffer, so every later write retries. */
+		pr_warn_ratelimited("lbd%d: cannot open %s: %ld\n",
+				    dev->index, name, PTR_ERR(f));
 		return PTR_ERR(f);
 	}
 
@@ -736,30 +761,33 @@ static int lbd_open_log_file(struct lbd_device *dev)
  * label, and writes the CBOR header into the buffer.  No file is
  * created on disk — that happens lazily in lbd_log_flush().
  */
-static void lbd_begin_segment(struct lbd_device *dev)
+static void lbd_begin_segment(struct lbd_device *dev, u64 size)
 {
 	dev->log_file = NULL;
 	dev->log_buf_used = 0;
 	dev->log_has_entries = false;
+	dev->log_device_size = size;
 	dev->segment_start_time = ktime_get();
 	lbd_tai64n_label(dev->log_segment_label);
 	lbd_write_log_header(dev);
 }
 
-static void lbd_rotate_segment(struct lbd_device *dev)
+static int lbd_rotate_segment(struct lbd_device *dev, bool sync_dir)
 {
 	char final_name[48];
+	struct file *dir;
 	int ret;
 
 	if (!dev->log_has_entries)
-		return;
+		return 0;
 
 	/* Flush buffer (lazy-opens .log.tmp) then fsync */
-	lbd_log_flush(dev);
-	if (!dev->log_file)
-		goto next;
-
-	vfs_fsync(dev->log_file, 0);
+	ret = lbd_log_flush(dev);
+	if (ret)
+		return ret;
+	ret = vfs_fsync(dev->log_file, 0);
+	if (ret)
+		return ret;
 
 	/* Rename disk.<tai64n>.log.tmp -> disk.<tai64n>.log */
 	lbd_log_name_final(dev->log_segment_label, final_name,
@@ -767,25 +795,39 @@ static void lbd_rotate_segment(struct lbd_device *dev)
 
 	ret = lbd_rename_file(dev->log_file, final_name);
 	if (ret)
-		pr_warn("lbd%d: rename to %s failed: %d\n",
-			dev->index, final_name, ret);
+		return ret;
 
+	/* A resize header must survive a crash even with no subsequent writes.
+	 * Ordinary flush rotations skip this to keep the flush path cheap. */
+	if (sync_dir) {
+		dir = file_open_root(&dev->log_dir_path, ".", O_RDONLY | O_DIRECTORY, 0);
+		if (IS_ERR(dir)) {
+			ret = PTR_ERR(dir);
+		} else {
+			ret = vfs_fsync(dir, 0);
+			fput(dir);
+		}
+	}
+
+	/* Once renamed, the segment is immutable even if directory fsync fails.
+	 * Notify its consumers and start fresh, but propagate the durability
+	 * error so resize cannot expose capacity until a successful retry. */
 	fput(dev->log_file);
 	dev->log_file = NULL;
 
-next:
 	atomic64_inc(&dev->stat_log_rotations);
 
 	/* Notify watchers before lbd_begin_segment() overwrites the label */
 	lbd_notify_watchers(dev);
 
 	/* Begin fresh segment (buffer only, no file yet) */
-	lbd_begin_segment(dev);
+	lbd_begin_segment(dev, dev->size);
 
 	/* Reschedule age timer */
 	if (dev->log_max_age_secs > 0)
 		mod_delayed_work(system_wq, &dev->log_rotate_dwork,
 				 msecs_to_jiffies(dev->log_max_age_secs * 1000));
+	return ret;
 }
 
 static void lbd_log_rotate_work_fn(struct work_struct *work)
@@ -795,7 +837,7 @@ static void lbd_log_rotate_work_fn(struct work_struct *work)
 
 	mutex_lock(&dev->log_mutex);
 	if (dev->log_has_entries)
-		lbd_rotate_segment(dev);
+		lbd_rotate_segment(dev, false);
 	mutex_unlock(&dev->log_mutex);
 }
 
@@ -805,7 +847,7 @@ static void lbd_maybe_rotate_segment(struct lbd_device *dev)
 		i_size_read(file_inode(dev->log_file)) : 0;
 
 	if (file_size + dev->log_buf_used >= (loff_t)dev->log_max_size)
-		lbd_rotate_segment(dev);
+		lbd_rotate_segment(dev, false);
 }
 
 static void lbd_finalize_log(struct lbd_device *dev)
@@ -1070,7 +1112,7 @@ static int lbd_add_device(struct lbd_ctl_add __user *uarg)
 	}
 
 	/* Begin initial log segment (file created lazily on first flush) */
-	lbd_begin_segment(dev);
+	lbd_begin_segment(dev, dev->size);
 
 	/* Set capacity and activate */
 	set_capacity(dev->gd, dev->size >> SECTOR_SHIFT);
@@ -1174,6 +1216,126 @@ static int lbd_remove_device(struct lbd_ctl_remove __user *uarg)
 	pr_info("lbd%d: detaching\n", dev->index);
 	lbd_destroy_device(dev);
 	return 0;
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+static unsigned int lbd_freeze_queue(struct request_queue *q)
+{
+#if LBD_HAS_FREEZE_MEMFLAGS
+	return blk_mq_freeze_queue(q);
+#else
+	blk_mq_freeze_queue(q);
+	return memalloc_noio_save();
+#endif
+}
+
+static void lbd_unfreeze_queue(struct request_queue *q, unsigned int memflags)
+{
+#if LBD_HAS_FREEZE_MEMFLAGS
+	blk_mq_unfreeze_queue(q, memflags);
+#else
+	memalloc_noio_restore(memflags);
+	blk_mq_unfreeze_queue(q);
+#endif
+}
+#endif
+
+static int lbd_resize_device(struct lbd_ctl_resize __user *uarg)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+	/* set_capacity alone leaves the live block inode size stale. */
+	return -EOPNOTSUPP;
+#else
+	struct lbd_ctl_resize arg;
+	struct lbd_device *dev;
+	struct file *expected;
+	loff_t old_size, image_size;
+	loff_t pos = 0;
+	__be32 magic;
+	unsigned int memflags;
+	int ret = 0;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (!arg.size || arg.size > S64_MAX || arg.size % LBD_BLOCK_SIZE)
+		return -EINVAL;
+	expected = fget(arg.backing_fd);
+	if (!expected)
+		return -EBADF;
+
+	/* Pins the device and serializes with remove and concurrent resizes. */
+	mutex_lock(&lbd_devices_mutex);
+	dev = idr_find(&lbd_devices, arg.index);
+	if (!dev) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (dev->state != LBD_STATE_BOUND) {
+		ret = -EBUSY;
+		goto out;
+	}
+	if (file_inode(expected) != file_inode(dev->backing_file)) {
+		ret = -ESTALE;
+		goto out;
+	}
+	if (dev->is_qcow2 || dev->base ||
+	    !S_ISREG(file_inode(expected)->i_mode)) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+	/* Standard qcow2 is not lbd's qcow2-lz4 and attach treats it as raw.
+	 * Never extend a recognized container as if its length were capacity. */
+	ret = kernel_read(dev->backing_file, &magic, sizeof(magic), &pos);
+	if (ret != sizeof(magic)) {
+		ret = ret < 0 ? ret : -EIO;
+		goto out;
+	}
+	if (be32_to_cpu(magic) == 0x514649fb) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+	ret = 0;
+	old_size = dev->size;
+	image_size = i_size_read(file_inode(dev->backing_file));
+	if (arg.size < old_size || arg.size < image_size || image_size < old_size) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/* Freeze drains requests, not merely dispatch: workers must finish before
+	 * taking log_mutex. Mounted users may remain open throughout. */
+	memflags = lbd_freeze_queue(dev->gd->queue);
+	mutex_lock(&dev->log_mutex);
+	if (image_size < arg.size)
+		ret = vfs_truncate(&dev->backing_file->f_path, arg.size);
+	if (!ret)
+		ret = vfs_fsync(dev->backing_file, 0);
+	if (ret)
+		goto unfreeze;
+
+	ret = lbd_rotate_segment(dev, true);
+	if (ret)
+		goto unfreeze;
+	/* Publish a durable header-only segment before exposing capacity. Keep
+	 * old capacity on failure; retry may safely finish the pending segment.
+	 * Do this even at equal size: reattach after image growth may have
+	 * adopted the new size without ever recording a durable boundary. */
+	lbd_begin_segment(dev, arg.size);
+	dev->log_has_entries = true;
+	ret = lbd_rotate_segment(dev, true);
+	if (ret)
+		goto unfreeze;
+	WRITE_ONCE(dev->size, arg.size);
+	lbd_begin_segment(dev, dev->size);
+	set_capacity_and_notify(dev->gd, arg.size >> SECTOR_SHIFT);
+unfreeze:
+	mutex_unlock(&dev->log_mutex);
+	lbd_unfreeze_queue(dev->gd->queue, memflags);
+out:
+	mutex_unlock(&lbd_devices_mutex);
+	fput(expected);
+	return ret;
+#endif
 }
 
 static int lbd_info_device(struct lbd_ctl_info __user *uarg)
@@ -1570,7 +1732,7 @@ static void lbd_notify_watchers(struct lbd_device *dev)
 	struct lbd_watcher *w;
 	ev.dev_index = dev->index;
 	ev.log_seq = dev->log_seq;
-	ev.device_size = dev->size;
+	ev.device_size = dev->log_device_size;
 	memcpy(ev.segment_label, dev->log_segment_label,
 	       sizeof(ev.segment_label));
 	strscpy(ev.log_dir, dev->log_dir, sizeof(ev.log_dir));
@@ -2070,6 +2232,8 @@ static long lbd_ctl_ioctl(struct file *file, unsigned int cmd,
 		return lbd_remove_device((struct lbd_ctl_remove __user *)arg);
 	case LBD_CTL_INFO:
 		return lbd_info_device((struct lbd_ctl_info __user *)arg);
+	case LBD_CTL_RESIZE:
+		return lbd_resize_device((struct lbd_ctl_resize __user *)arg);
 	default:
 		return -ENOTTY;
 	}

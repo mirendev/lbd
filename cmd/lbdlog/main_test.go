@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"hash/crc32"
 	"io"
 	"os"
@@ -8,10 +10,147 @@ import (
 	"sort"
 	"testing"
 
-	"miren.dev/lbd"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"miren.dev/lbd"
 )
+
+func TestGrowingLogCapacitySurvivesCompaction(t *testing.T) {
+	for _, compact := range []string{"none", "repack", "gc"} {
+		t.Run(compact, func(t *testing.T) {
+			dir := t.TempDir()
+			old := testHeader("aaa")
+			grown := testHeader("bbb")
+			grown.DeviceSize = 1 << 30 // Requires another qcow2 L1 entry.
+			writeSegment(t, dir, "disk.aaa.log", old, []*lbd.Entry{
+				makeWriteEntry(0, 2, 0, 'A'),
+			})
+			writeSegment(t, dir, "disk.bbb.log", grown, nil)
+			// Last header is deliberately smaller; using just first or last
+			// loses the size boundary, even with no writes in the grown tail.
+			writeSegment(t, dir, "disk.ccc.log", old, []*lbd.Entry{
+				makeWriteEntry(0, 1, 1, 'B'),
+			})
+			if compact == "repack" {
+				require.NoError(t, runRepack(&repackArgs{LogDir: dir, Inplace: true}))
+			} else if compact == "gc" {
+				result, err := lbd.RunGC(context.Background(), lbd.GCConfig{LogDir: dir, Threshold: 75})
+				require.NoError(t, err)
+				f, err := os.Open(result.NewSegmentPath)
+				require.NoError(t, err)
+				rd, err := lbd.NewReader(f)
+				f.Close()
+				require.NoError(t, err)
+				require.Equal(t, grown.DeviceSize, rd.Header.DeviceSize)
+				// Incremental GC must read capacity from old headers too.
+				_, err = lbd.RunGC(context.Background(), lbd.GCConfig{LogDir: dir, Threshold: 75})
+				require.NoError(t, err)
+			}
+			for _, qcow := range []bool{false, true} {
+				out := filepath.Join(t.TempDir(), "out")
+				require.NoError(t, runReplay(&replayArgs{LogDir: dir, OutputPath: out, QCow2: qcow}))
+				var reader io.ReaderAt
+				if qcow {
+					img, err := lbd.OpenQCow2ReadOnly(out)
+					require.NoError(t, err)
+					defer img.Close()
+					require.Equal(t, grown.DeviceSize, img.VirtualSize)
+					reader = img
+				} else {
+					f, err := os.Open(out)
+					require.NoError(t, err)
+					defer f.Close()
+					st, err := f.Stat()
+					require.NoError(t, err)
+					require.Equal(t, int64(grown.DeviceSize), st.Size())
+					reader = f
+				}
+				buf := make([]byte, 2*testBlockSize)
+				_, err := reader.ReadAt(buf, 0)
+				require.NoError(t, err)
+				require.Equal(t, bytes.Repeat([]byte{'B'}, testBlockSize), buf[:testBlockSize])
+				require.Equal(t, bytes.Repeat([]byte{'A'}, testBlockSize), buf[testBlockSize:])
+				_, err = reader.ReadAt(buf[:testBlockSize], int64(grown.DeviceSize)-testBlockSize)
+				require.NoError(t, err)
+				require.Equal(t, make([]byte, testBlockSize), buf[:testBlockSize])
+			}
+		})
+	}
+}
+
+func TestIncrementalReplayGrowth(t *testing.T) {
+	for _, qcow := range []bool{false, true} {
+		t.Run(map[bool]string{false: "raw", true: "qcow2"}[qcow], func(t *testing.T) {
+			dir := t.TempDir()
+			out := filepath.Join(t.TempDir(), "out")
+			cfg := &replayArgs{LogDir: dir, OutputPath: out, QCow2: qcow, DB: filepath.Join(t.TempDir(), "replay.db")}
+			old := testHeader("aaa")
+			writeSegment(t, dir, "disk.aaa.log", old, []*lbd.Entry{makeWriteEntry(0, 1, 0, 'A')})
+			require.NoError(t, runReplay(cfg))
+			grown := testHeader("bbb")
+			grown.DeviceSize *= 3
+			writeSegment(t, dir, "disk.bbb.log", grown, nil)
+			if qcow {
+				require.ErrorContains(t, runReplay(cfg), "incremental qcow2 growth is unsupported")
+				// A rejected attempt must not consume the boundary/checkpoint.
+				require.ErrorContains(t, runReplay(cfg), "incremental qcow2 growth is unsupported")
+				return
+			}
+			require.NoError(t, runReplay(cfg))
+			st, err := os.Stat(out)
+			require.NoError(t, err)
+			require.Equal(t, int64(grown.DeviceSize), st.Size())
+			writeSegment(t, dir, "disk.ccc.log", old, []*lbd.Entry{makeWriteEntry(600, 1, 1, 'Z')})
+			require.NoError(t, runReplay(cfg))
+			st, err = os.Stat(out)
+			require.NoError(t, err)
+			require.Equal(t, int64(grown.DeviceSize), st.Size())
+			f, err := os.Open(out)
+			require.NoError(t, err)
+			defer f.Close()
+			buf := make([]byte, testBlockSize)
+			_, err = f.ReadAt(buf, 600*testBlockSize)
+			require.NoError(t, err)
+			require.Equal(t, bytes.Repeat([]byte{'Z'}, testBlockSize), buf)
+		})
+	}
+}
+
+func TestReplayTailBeyondOriginalQCow2L1(t *testing.T) {
+	dir := t.TempDir()
+	writeSegment(t, dir, "disk.aaa.log", testHeader("aaa"), nil)
+	grown := testHeader("bbb")
+	grown.DeviceSize = 1 << 30
+	tail := makeWriteEntry((600<<20)/testBlockSize, 1, 0, 'Z')
+	writeSegment(t, dir, "disk.bbb.log", grown, []*lbd.Entry{tail})
+	out := filepath.Join(t.TempDir(), "out.qcow2")
+	require.NoError(t, runReplay(&replayArgs{LogDir: dir, OutputPath: out, QCow2: true}))
+	img, err := lbd.OpenQCow2ReadOnly(out)
+	require.NoError(t, err)
+	defer img.Close()
+	require.Equal(t, grown.DeviceSize, img.VirtualSize)
+	buf := make([]byte, testBlockSize)
+	_, err = img.ReadAt(buf, 600<<20)
+	require.NoError(t, err)
+	require.Equal(t, tail.Data, buf)
+}
+
+func TestGCRetainsCapacityOfFullyShadowedSegment(t *testing.T) {
+	dir := t.TempDir()
+	grown := testHeader("aaa")
+	grown.DeviceSize *= 4
+	writeSegment(t, dir, "disk.aaa.log", grown, []*lbd.Entry{makeWriteEntry(0, 1, 0, 'A')})
+	writeSegment(t, dir, "disk.bbb.log", testHeader("bbb"), []*lbd.Entry{makeWriteEntry(0, 1, 1, 'B')})
+	result, err := lbd.RunGC(context.Background(), lbd.GCConfig{LogDir: dir, Threshold: 75})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.RetiredCount)
+	require.Zero(t, result.CopiedEntries)
+	out := filepath.Join(t.TempDir(), "out.raw")
+	require.NoError(t, runReplay(&replayArgs{LogDir: dir, OutputPath: out}))
+	st, err := os.Stat(out)
+	require.NoError(t, err)
+	require.Equal(t, int64(grown.DeviceSize), st.Size())
+}
 
 // --- Helpers for GC integration tests ---
 

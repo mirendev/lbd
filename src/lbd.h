@@ -43,6 +43,14 @@ enum lbd_state {
 #define LBD_CTL_ADD		_IOWR(LBD_CTL_MAGIC, 0, struct lbd_ctl_add)
 #define LBD_CTL_REMOVE		_IOW(LBD_CTL_MAGIC, 1, struct lbd_ctl_remove)
 #define LBD_CTL_INFO		_IOWR(LBD_CTL_MAGIC, 2, struct lbd_ctl_info)
+#define LBD_CTL_RESIZE		_IOW(LBD_CTL_MAGIC, 3, struct lbd_ctl_resize)
+
+/* Fixed-width ABI, including on compat tasks. fd pins expected backing inode. */
+struct lbd_ctl_resize {
+	__s32 index;
+	__s32 backing_fd;
+	__u64 size;
+};
 
 struct lbd_ctl_add {
 	char path[LBD_LOG_PATH_MAX];
@@ -148,6 +156,7 @@ struct lbd_device {
 	/* Log segmentation — all protected by log_mutex */
 	struct mutex log_mutex;
 	bool log_has_entries;		/* current segment has data entries */
+	u64 log_device_size;		/* size in this segment's header */
 	u64 log_seq;			/* global, never resets */
 	char log_segment_label[25];	/* current segment TAI64N label */
 	u64 log_max_size;		/* rotation size threshold */
@@ -237,6 +246,17 @@ struct lbd_device {
 #define LBD_HAS_LOOKUP_ONE_QSTR 1
 #else
 #define LBD_HAS_LOOKUP_ONE_QSTR 0
+#endif
+
+/*
+ * 6.14: blk_mq_freeze_queue() returns memalloc flags that unfreeze restores,
+ * so allocations while frozen cannot recurse into I/O on the frozen device.
+ * Older kernels get the same protection from memalloc_noio_save().
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
+#define LBD_HAS_FREEZE_MEMFLAGS 1
+#else
+#define LBD_HAS_FREEZE_MEMFLAGS 0
 #endif
 
 /* 6.18+: struct renamedata uses single mnt_idmap field

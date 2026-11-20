@@ -76,6 +76,12 @@ struct lbd_ctl_remove {
 	__s32 index;
 };
 
+struct lbd_ctl_resize {
+	__s32 index;
+	__s32 backing_fd;
+	__u64 size;
+};
+
 struct lbd_ctl_info {
 	__s32 index;
 	__u32 state;
@@ -86,6 +92,7 @@ struct lbd_ctl_info {
 #define LBD_CTL_ADD		_IOWR(LBD_CTL_MAGIC, 0, struct lbd_ctl_add)
 #define LBD_CTL_REMOVE		_IOW(LBD_CTL_MAGIC, 1, struct lbd_ctl_remove)
 #define LBD_CTL_INFO		_IOWR(LBD_CTL_MAGIC, 2, struct lbd_ctl_info)
+#define LBD_CTL_RESIZE		_IOW(LBD_CTL_MAGIC, 3, struct lbd_ctl_resize)
 
 #define LBD_CTL_PATH		"/dev/lbd-control"
 
@@ -2806,12 +2813,74 @@ static int cmd_swap(int argc, char **argv)
  * Main
  * ---------------------------------------------------------------- */
 
+static int cmd_resize(int argc, char **argv)
+{
+	struct lbd_ctl_resize arg = { .index = -1, .backing_fd = -1 };
+	const char *backing = NULL;
+	int fd, json = 0, have_size = 0;
+	char *end;
+
+	for (int i = 0; i < argc; i++) {
+		if (!strcmp(argv[i], "--json")) {
+			json = 1;
+		} else if (!strcmp(argv[i], "--backing") && i + 1 < argc) {
+			backing = argv[++i];
+		} else if (!strcmp(argv[i], "--size") && i + 1 < argc) {
+			const char *s = argv[++i];
+			errno = 0;
+			arg.size = strtoull(s, &end, 10);
+			if (s[0] < '0' || s[0] > '9' || *end || errno ||
+			    !arg.size || arg.size > INT64_MAX || arg.size % 4096)
+				goto invalid;
+			have_size = 1;
+		} else if (arg.index == -1) {
+			long index;
+			errno = 0;
+			index = strtol(argv[i], &end, 10);
+			if (argv[i][0] < '0' || argv[i][0] > '9' || *end ||
+			    errno || index < 0 || index > 255)
+				goto invalid;
+			arg.index = index;
+		} else {
+			goto invalid;
+		}
+	}
+	if (arg.index < 0 || !have_size || !backing)
+		goto invalid;
+	arg.backing_fd = open(backing, O_RDONLY | O_CLOEXEC);
+	if (arg.backing_fd < 0) {
+		fprintf(stderr, "Cannot open backing '%s': %s\n", backing, strerror(errno));
+		return 1;
+	}
+	fd = open(LBD_CTL_PATH, O_RDWR | O_CLOEXEC);
+	if (fd < 0 || ioctl(fd, LBD_CTL_RESIZE, &arg) < 0) {
+		fprintf(stderr, "Resize lbd%d failed: %s\n", arg.index, strerror(errno));
+		if (fd >= 0)
+			close(fd);
+		close(arg.backing_fd);
+		return 1;
+	}
+	close(fd);
+	close(arg.backing_fd);
+	if (json)
+		printf("{\"device\":\"/dev/lbd%d\",\"index\":%d,\"size\":%llu}\n",
+		       arg.index, arg.index, (unsigned long long)arg.size);
+	else
+		printf("Resized lbd%d to %llu bytes\n", arg.index,
+		       (unsigned long long)arg.size);
+	return 0;
+invalid:
+	fprintf(stderr, "resize requires --size <positive 4096-aligned decimal bytes> --backing <path> <index>\n");
+	return 1;
+}
+
 static void usage(void)
 {
 	fprintf(stderr,
 		"Usage:\n"
 		"  lbdctl add [opts] <path>           Create a new lbd device backed by <path>\n"
 		"  lbdctl remove <N>                  Remove /dev/lbdN\n"
+		"  lbdctl resize [--json] --size <bytes> --backing <path> <N>\n"
 		"  lbdctl list                        List all active lbd devices\n"
 		"  lbdctl watch [opts]                Watch for log rotation events\n"
 		"  lbdctl miss-handler [opts]         Handle block miss events\n"
@@ -2869,6 +2938,9 @@ int main(int argc, char **argv)
 	if (strcmp(argv[1], "remove") == 0) {
 		return cmd_remove(argc - 2, argv + 2);
 	}
+
+	if (strcmp(argv[1], "resize") == 0)
+		return cmd_resize(argc - 2, argv + 2);
 
 	if (strcmp(argv[1], "list") == 0) {
 		return cmd_list(argc - 2, argv + 2);
