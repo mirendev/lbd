@@ -746,8 +746,9 @@ static int lbd_open_log_file(struct lbd_device *dev)
 	f = file_open_root(&dev->log_dir_path, name,
 			   O_RDWR | O_CREAT | O_TRUNC | O_LARGEFILE, 0600);
 	if (IS_ERR(f)) {
-		pr_warn("lbd%d: cannot open %s: %ld\n",
-			dev->index, name, PTR_ERR(f));
+		/* A failed flush keeps the buffer, so every later write retries. */
+		pr_warn_ratelimited("lbd%d: cannot open %s: %ld\n",
+				    dev->index, name, PTR_ERR(f));
 		return PTR_ERR(f);
 	}
 
